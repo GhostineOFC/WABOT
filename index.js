@@ -1,6 +1,6 @@
-// WABOT V3.1.6 — inicialização compatível com Node.js CommonJS e ESM.
+// WABOT V3.3.0 — Otimização de desempenho e filas.
 (async () => {
-    console.log('[WABOT 3.1.6] Arquivo index.js carregado. Preparando dependências...');
+    console.log('[WABOT 3.2.5] Arquivo index.js carregado. Preparando dependências...');
 
 // WABOT V3.1.0 — mercado, guildas, chefes, PvP e missões
 
@@ -30,7 +30,7 @@ const path = (await import('node:path')).default;
 const DIRETORIO = path.dirname(process.argv[1] || '.');
 
 const PREFIXO = '!';
-const VERSAO = '3.1.7';
+const VERSAO = '3.3.0';
 
 const SESSAO = path.join(DIRETORIO, 'sessao');
 
@@ -68,6 +68,7 @@ let tentativasReconexao = 0;
 
 const mensagensProcessadas = new Set();
 const cacheNomesUsuarios = new Map();
+const aliasesUsuarios = new Map();
 const cacheNomesGrupos = new Map();
 const TTL_NOMES_GRUPO = 5 * 60 * 1000;
 
@@ -78,6 +79,8 @@ const enquetes = new Map();
 const entrevistasAtivas = new Map();
 const jogosDaVelha = new Map();
 const menusLojaPesca = new Map(); // menu numérico individual por usuário e conversa
+const partidasPoker = new Map(); // uma partida solo por jogador/conversa
+const dificuldadePoker = new Map();
 
 const cooldownPesca = new Map();
 const pescariasEmAndamento = new Set();
@@ -90,17 +93,62 @@ let dadosPesca = {};
 let historicoEntrevistas = {};
 let carteirasWACoins = {};
 let dadosRPG = {};
-let sistemasV310 = { mercado: [], guildas: {}, membrosGuilda: {}, chefes: {}, desafiosPVP: {}, recompensasDiarias: {} };
+let sistemasV310 = { mercado: [], guildas: {}, membrosGuilda: {}, tripulacoes: {}, membrosTripulacao: {}, chefes: {}, desafiosPVP: {}, recompensasDiarias: {} };
 let manutencaoAtiva = false;
 let timerResetAgendado = null;
 const gravacoesEmAndamento = new Map();
 const filasMensagens = new Map();
+let timerSalvarMensagens = null;
+let mensagensPrecisamSalvar = false;
+let salvandoMensagens = false;
+let promessaSalvarMensagens = null;
+const INTERVALO_DEBOUNCE_MENSAGENS = 1200;
+const MAX_CONVERSAS_HISTORICO = 300;
+const MAX_MENSAGENS_HISTORICO_POR_CONVERSA = 250;
 const MAX_PROCESSAMENTOS_SIMULTANEOS = 3;
 const MAX_FILA_POR_CONVERSA = 40;
 const MAX_MENSAGENS_PENDENTES = 250;
 let processamentosAtivos = 0;
 let mensagensPendentes = 0;
 let ultimoLogSaude = 0;
+
+// Diagnóstico em memória: histórico limitado para não crescer indefinidamente.
+const historicoErrosBot = [];
+const LIMITE_HISTORICO_ERROS = 100;
+let sequenciaErroBot = 0;
+
+// Catálogo de códigos internos de diagnóstico. São categorias de referência,
+// não códigos HTTP e não indicam que o erro já ocorreu.
+const CATALOGO_ERROS_WABOT = {
+    200: { titulo: 'ERRO NÃO CLASSIFICADO', descricao: 'Ocorreu uma falha que não correspondeu a uma categoria específica.', causa: 'Exceção inesperada ou mensagem de erro sem padrão reconhecido.', acao: 'Consulte !erros e envie o registro completo para análise.' },
+    202: { titulo: 'ERRO DE PROCESSAMENTO', descricao: 'O bot falhou ao processar uma mensagem ou executar uma rotina.', causa: 'Dados inesperados, estado inválido ou falha em uma função.', acao: 'Repita uma vez. Se persistir, consulte !erros.' },
+    203: { titulo: 'ERRO DE ARQUIVO / JSON', descricao: 'Falha ao ler, interpretar ou salvar dados locais.', causa: 'JSON inválido, arquivo ausente ou permissão de escrita.', acao: 'Verifique os arquivos de dados e as permissões no host. Faça backup antes de qualquer reparo.' },
+    204: { titulo: 'ERRO DE COMANDO', descricao: 'Um comando recebeu argumentos inválidos ou falhou durante sua execução.', causa: 'Sintaxe incorreta, parâmetro ausente ou falha na rotina do comando.', acao: 'Confira !help ou !helprpg e tente novamente com a sintaxe indicada.' },
+    205: { titulo: 'ERRO DE CONEXÃO', descricao: 'A conexão com o WhatsApp foi interrompida ou não pôde ser estabelecida.', causa: 'Instabilidade de rede, sessão desconectada ou indisponibilidade do serviço.', acao: 'Confira o console do Enzonic e o estado da sessão do Baileys.' },
+    206: { titulo: 'ERRO DE IMAGEM', descricao: 'Falha ao gerar, carregar ou enviar uma imagem.', causa: 'Arquivo de mídia ausente, SVG inválido ou erro no processamento do Sharp.', acao: 'Confira a pasta midia e o registro em !erros.' },
+    207: { titulo: 'ERRO DE RPG / JOGO', descricao: 'Falha em uma operação de RPG, masmorra, pesca ou minijogo.', causa: 'Dados de jogador inconsistentes ou estado inesperado da partida.', acao: 'Consulte o perfil e envie o código da mensagem junto com o registro do erro.' }
+};
+
+function classificarCodigoErro(erro) {
+    const texto = String(erro || '').toLowerCase();
+    if (/json|enoent|eacces|permission|readfile|writefile|arquivo|syntaxerror.*json/.test(texto)) return 203;
+    if (/sharp|svg|png|jpeg|image|imagem|midia|mídia/.test(texto)) return 206;
+    if (/connection|socket|timed out|timeout|disconnect|stream erro|whatsapp|baileys/.test(texto)) return 205;
+    if (/masmorra|rpg|pesca|wacoin|jogador|inventario|inventário/.test(texto)) return 207;
+    if (/comando|argument|parâmetro|parametro|syntax/.test(texto)) return 204;
+    if (/message|process|handler|upsert|undefined|null/.test(texto)) return 202;
+    return 200;
+}
+
+const historicoCodigosMensagem = new Map();
+const LIMITE_CODIGOS_MENSAGEM = 5000;
+const consoleErrorOriginal = console.error.bind(console);
+console.error = (...args) => {
+    const erro = args.map(item => item instanceof Error ? (item.stack || item.message) : String(item)).join(' ');
+    historicoErrosBot.push({ numero: ++sequenciaErroBot, codigo: classificarCodigoErro(erro), horario: new Date().toISOString(), erro: erro.slice(0, 3000) });
+    if (historicoErrosBot.length > LIMITE_HISTORICO_ERROS) historicoErrosBot.shift();
+    consoleErrorOriginal(...args);
+};
 
 
 // ==================================================
@@ -124,6 +172,120 @@ function escaparSVG(valor) {
     return String(valor ?? '').normalize('NFC').replace(/[&<>"']/g, caractere => ({
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;'
     })[caractere]);
+}
+
+// ==================================================
+// IDENTIDADE VISUAL SAZONAL E CÓDIGOS DE MENSAGEM
+// ==================================================
+
+function estaNaEdicaoNatalina() {
+    const hoje = dataLocalISO();
+    return hoje >= '2026-11-23' && hoje <= '2027-01-02';
+}
+
+function gerarCodigoMensagem() {
+    const data = dataLocalISO().replace(/-/g, '');
+    const sequencia = randomInt(0, 36 ** 5).toString(36).toUpperCase().padStart(5, '0');
+    return `WB-${data}-${sequencia}`;
+}
+
+function aplicarMolduraNatalSVG(svgOriginal) {
+    const svg = String(svgOriginal ?? '');
+    if (!estaNaEdicaoNatalina() || !svg.includes('</svg>')) return svg;
+    const largura = Math.max(100, Number(svg.match(/<svg[^>]*\bwidth=["'](\d+)/i)?.[1]) || 1024);
+    const altura = Math.max(100, Number(svg.match(/<svg[^>]*\bheight=["'](\d+)/i)?.[1]) || 1024);
+    const moldura = `<g opacity=".96" pointer-events="none"><rect x="5" y="5" width="${largura-10}" height="${altura-10}" rx="24" fill="none" stroke="#B72F45" stroke-width="9"/><rect x="15" y="15" width="${largura-30}" height="${altura-30}" rx="19" fill="none" stroke="#1E7A50" stroke-width="4"/><circle cx="38" cy="38" r="9" fill="#F4D477"/><circle cx="${largura-38}" cy="38" r="9" fill="#F4D477"/><circle cx="38" cy="${altura-38}" r="9" fill="#F4D477"/><circle cx="${largura-38}" cy="${altura-38}" r="9" fill="#F4D477"/><path d="M${largura/2-20} 18 l8 13 12 2 -10 9 2 13 -12 -6 -12 6 2 -13 -10 -9 12 -2z" fill="#F4D477"/></g>`;
+    return svg.replace('</svg>', `${moldura}</svg>`);
+}
+
+function decorarSaidaWABOT(conteudo, jid = '') {
+    if (!conteudo || typeof conteudo !== 'object') return conteudo;
+    const saida = { ...conteudo };
+    const codigo = gerarCodigoMensagem();
+    const textoOriginal = [saida.text, saida.caption].filter(v => typeof v === 'string').join('\n');
+    historicoCodigosMensagem.set(codigo, { jid: String(jid || ''), criadoEm: Date.now(), conteudo: textoOriginal.slice(0, 3500) });
+    while (historicoCodigosMensagem.size > LIMITE_CODIGOS_MENSAGEM) historicoCodigosMensagem.delete(historicoCodigosMensagem.keys().next().value);
+    console.log(`[WABOT] Código de mensagem gerado: ${codigo}`);
+    const seloNatal = estaNaEdicaoNatalina() ? '🎄 *WABOT • EDIÇÃO DE NATAL* 🎄\n\n' : '';
+    const sufixo = `\n\n🔎 Código da mensagem: *${codigo}*`;
+    if (typeof saida.text === 'string') {
+        saida.text = `${seloNatal}${saida.text}${sufixo}`;
+    }
+    if (typeof saida.caption === 'string') {
+        saida.caption = `${seloNatal}${saida.caption}${sufixo}`;
+    }
+    return saida;
+}
+
+async function gerarImagemPresenteNatal(nome, recompensa, extra) {
+    const nomeSeguro = escaparSVG(String(nome || 'Pescador').slice(0, 24));
+    const detalhe = extra ? 'BÔNUS SURPRESA ENCONTRADO!' : 'UM PRESENTE ESPECIAL PARA VOCÊ';
+    const svg = `<svg width="1080" height="720" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#082D25"/><stop offset=".55" stop-color="#14543B"/><stop offset="1" stop-color="#071B25"/></linearGradient><linearGradient id="gold"><stop stop-color="#FFF0A6"/><stop offset="1" stop-color="#D9A83E"/></linearGradient></defs><rect width="1080" height="720" fill="url(#bg)"/><circle cx="110" cy="90" r="180" fill="#FFFFFF" opacity=".04"/><circle cx="970" cy="620" r="240" fill="#FFFFFF" opacity=".04"/><path d="M0 570 Q220 510 430 585 T1080 565 V720 H0Z" fill="#0A332A"/><g fill="#F7E6B5" opacity=".9"><circle cx="120" cy="210" r="5"/><circle cx="920" cy="150" r="7"/><circle cx="840" cy="350" r="4"/><circle cx="230" cy="440" r="4"/><circle cx="730" cy="90" r="5"/></g><text x="540" y="105" text-anchor="middle" fill="#F6D77B" font-family="DejaVu Sans, sans-serif" font-size="27" letter-spacing="8" font-weight="bold">CORREIO DO POLO NORTE</text><text x="540" y="165" text-anchor="middle" fill="#FFFFFF" font-family="DejaVu Sans, sans-serif" font-size="48" font-weight="bold">PRESENTE DE NATAL</text><g transform="translate(540 390)"><ellipse cx="0" cy="165" rx="205" ry="30" fill="#031A17" opacity=".5"/><rect x="-155" y="-85" width="310" height="230" rx="22" fill="#B72F45" stroke="#F5D77A" stroke-width="8"/><rect x="-30" y="-85" width="60" height="230" fill="#E8C65D"/><rect x="-155" y="-10" width="310" height="48" fill="#E8C65D"/><path d="M0 -85 C-150 -210 -185 -65 -75 -48 C-40 -42 -10 -62 0 -85 C10 -62 40 -42 75 -48 C185 -65 150 -210 0 -85Z" fill="#D9B34D" stroke="#F8E6A5" stroke-width="7"/></g><text x="540" y="590" text-anchor="middle" fill="#F6D77B" font-family="DejaVu Sans, sans-serif" font-size="25" font-weight="bold">${detalhe}</text><text x="540" y="635" text-anchor="middle" fill="#FFFFFF" font-family="DejaVu Sans, sans-serif" font-size="22">${nomeSeguro} • +${recompensa} WACoins</text></svg>`;
+    return sharp(Buffer.from(aplicarMolduraNatalSVG(svg))).png({ compressionLevel: 9 }).toBuffer();
+}
+
+
+// ==================================================
+// INTERPRETADOR FLEXÍVEL DE COMANDOS — V3.2.1
+// ==================================================
+
+const COMANDOS_RECONHECIDOS = new Set(['!temporadapesca', '!tripulacao', '!8ball', '!aceitarvelha', '!anagrama', '!aprovar', '!banco', '!bio', '!cancelarentrevista', '!cancelarloja', '!cargo', '!chefe', '!chefemundial', '!chutarpalavra', '!comandos', '!comprarperfil', '!comprarpesca', '!conquistas', '!dado', '!depositar', '!desanagrama', '!desistirvelha', '!diario', '!divulgar', '!doar', '!duelo', '!eleicao', '!erros', '!codigos', '!codigo', '!buscarcodigo', '!entrevista', '!entrevistas', '!equiparperfil', '!escolher', '!evento', '!eventopesca', '!eventotempo', '!figurinha', '!forca', '!forjar', '!masmorra', '!frase', '!grupo', '!guilda', '!guildas', '!help', '!helprpg', '!id', '!info', '!inventarioperfil', '!jogarvelha', '!letra', '!limpar', '!limparmax', '!lojaperfil', '!lojapesca', '!mar', '!mares', '!mercado', '!missao', '!missoes', '!moeda', '!par', '!partido', '!peixes', '!presente', '!perfil', '!pescar', '!ping', '!poker', '!poderpolitico', '!politica', '!proposta', '!pvp', '!quiz', '!quizhard', '!quizparar', '!rankingpesca', '!rankingquiz', '!reagir', '!recompensadiaria', '!recusarvelha', '!renascerpesca', '!renascimento', '!reprovar', '!resetagendar', '!resgatar', '!resposta', '!resultado', '!rodadasorte', '!roleta', '!rpg', '!saldo', '!sequencia', '!ship', '!sobre', '!sorte', '!sorteio', '!statusperfil', '!tempoevento', '!tirarreacao', '!upd', '!uptime', '!velha', '!venderpeixes', '!video', '!votar', '!wacoins']);
+
+function mensagemTemPrefixo(texto) {
+    return /^!\s*\S/.test(String(texto ?? '').trimStart());
+}
+
+function distanciaEdicao(a, b) {
+    a = String(a); b = String(b);
+    const linha = Array.from({ length: b.length + 1 }, (_, i) => i);
+    for (let i = 1; i <= a.length; i++) {
+        let diagonal = linha[0];
+        linha[0] = i;
+        for (let j = 1; j <= b.length; j++) {
+            const acima = linha[j];
+            linha[j] = Math.min(
+                linha[j] + 1,
+                linha[j - 1] + 1,
+                diagonal + (a[i - 1] === b[j - 1] ? 0 : 1)
+            );
+            diagonal = acima;
+        }
+    }
+    return linha[b.length];
+}
+
+function interpretarComando(texto) {
+    // Extrai o comando e preserva todo o restante da mensagem como argumentos.
+    // Isso evita perder subcomandos como "ranking" em !politica ranking.
+    const bruto = String(texto ?? '').trim();
+    const limpo = bruto.replace(/^!\s*/, '!').replace(/[\t\r\n ]+/g, ' ');
+    const correspondencia = limpo.match(/^(![^\s]+)(?:\s+([\s\S]*))?$/);
+
+    if (!correspondencia) {
+        return { comando: normalizar(limpo), args: [], original: normalizar(limpo), corrigido: false, sugestao: null, textoArgumentos: '' };
+    }
+
+    let comando = normalizar(correspondencia[1]);
+    const textoArgumentos = String(correspondencia[2] || '').trim();
+    const args = textoArgumentos ? textoArgumentos.split(/\s+/) : [];
+
+    if (COMANDOS_RECONHECIDOS.has(comando)) {
+        return { comando, args, original: comando, corrigido: false, sugestao: null, textoArgumentos };
+    }
+
+    // Só corrige erros pequenos e inequívocos no nome principal do comando.
+    const candidatos = [...COMANDOS_RECONHECIDOS]
+        .map(opcao => ({ opcao, distancia: distanciaEdicao(comando, opcao) }))
+        .filter(item => item.distancia <= (comando.length <= 5 ? 1 : 2))
+        .sort((a, b) => a.distancia - b.distancia || a.opcao.localeCompare(b.opcao));
+
+    if (candidatos.length && (candidatos.length === 1 || candidatos[0].distancia < candidatos[1].distancia)) {
+        const original = comando;
+        comando = candidatos[0].opcao;
+        return { comando, args, original, corrigido: true, sugestao: comando, textoArgumentos };
+    }
+
+    return { comando, args, original: comando, corrigido: false, sugestao: candidatos[0]?.opcao || null, textoArgumentos };
 }
 
 async function salvarJSON(arquivo, dados) {
@@ -275,9 +437,14 @@ async function carregarDados() {
     carteirasWACoins = carteiras && typeof carteiras === 'object' ? carteiras : {};
     dadosRPG = rpg && typeof rpg === 'object' ? rpg : {};
     sistemasV310 = sistemas && typeof sistemas === 'object' ? sistemas : { mercado: [], guildas: {}, membrosGuilda: {}, chefes: {}, desafiosPVP: {}, recompensasDiarias: {} };
-    sistemasV310.mercado ||= []; sistemasV310.guildas ||= {}; sistemasV310.membrosGuilda ||= {}; sistemasV310.chefes ||= {}; sistemasV310.desafiosPVP ||= {}; sistemasV310.recompensasDiarias ||= {}; sistemasV310.resetAgendado ||= {}; sistemasV310.resetHistorico ||= [];
+    sistemasV310.mercado ||= []; sistemasV310.guildas ||= {}; sistemasV310.membrosGuilda ||= {}; sistemasV310.tripulacoes ||= {}; sistemasV310.membrosTripulacao ||= {}; sistemasV310.chefes ||= {}; sistemasV310.desafiosPVP ||= {}; sistemasV310.recompensasDiarias ||= {}; sistemasV310.resetAgendado ||= {}; sistemasV310.resetHistorico ||= []; sistemasV310.politica ||= { grupos: {} }; sistemasV310.politica.grupos ||= {};
+    sistemasV310.tripulacoes ||= {}; sistemasV310.membrosTripulacao ||= {};
+    sistemasV310.temporadaPesca ||= {}; sistemasV310.cidades ||= {}; sistemasV310.membrosCidade ||= {};
+    const politicaMigrada = migrarPoliticaParaGlobal();
+    if (politicaMigrada) await salvarSistemas310();
     await migrarEconomiaParaWACoins();
     if (migracaoPeixesAntigos) await salvarDadosPesca();
+    await verificarResetTemporadaPesca(false);
     manutencaoAtiva = Boolean(carteirasWACoins.__manutencao_ativa);
     for (const entrevista of Object.values(historicoEntrevistas)) {
         if (entrevista?.status === 'em_andamento' && entrevista.grupoJid) {
@@ -286,12 +453,28 @@ async function carregarDados() {
     }
 }
 
+function encontrarChaveUsuario(objeto, id) {
+    if (!objeto || !id) return null;
+    if (Object.prototype.hasOwnProperty.call(objeto, id)) return id;
+    return Object.keys(objeto).find(chave => mesmoUsuario(chave, id)) || null;
+}
+
 function mesmoUsuario(a, b) {
     if (!a || !b) return false;
     const limpar = valor => String(valor).split(':')[0].toLowerCase();
-    const A = limpar(a);
-    const B = limpar(b);
-    if (A === B) return true;
+    const resolver = valor => {
+        let atual = limpar(valor);
+        const vistos = new Set();
+        while (aliasesUsuarios.has(atual) && !vistos.has(atual)) {
+            vistos.add(atual);
+            const proximo = aliasesUsuarios.get(atual);
+            if (!proximo || proximo === atual) break;
+            atual = proximo;
+        }
+        return atual;
+    };
+    const A = limpar(a), B = limpar(b);
+    if (A === B || resolver(A) === resolver(B)) return true;
     const numeroA = A.split('@')[0].replace(/\D/g, '');
     const numeroB = B.split('@')[0].replace(/\D/g, '');
     return Boolean(numeroA && numeroB && numeroA === numeroB);
@@ -316,6 +499,13 @@ function obterParticipante(msg) {
 }
 
 function obterNome(msg) {
+    const participante = msg.key?.participant || '';
+    const alternativo = msg.key?.participantAlt || '';
+    if (participante && alternativo) {
+        const a = String(participante).split(':')[0].toLowerCase();
+        const b = String(alternativo).split(':')[0].toLowerCase();
+        aliasesUsuarios.set(a,a); aliasesUsuarios.set(b,a);
+    }
     const nome = msg.pushName || msg.verifiedBizName || '';
     if (nome) {
         registrarNomeUsuario(obterParticipante(msg), nome);
@@ -347,6 +537,8 @@ async function atualizarNomesDoGrupo(sock, grupoJid) {
         const metadata = await sock.groupMetadata(grupoJid);
         for (const participante of metadata.participants || []) {
             const nome = participante.notify || participante.name || participante.verifiedName || participante.shortName;
+            const ids = [participante.id, participante.jid, participante.phoneNumber].filter(Boolean).map(x=>String(x).split(':')[0].toLowerCase());
+            if (ids.length) { aliasesUsuarios.set(ids[0],ids[0]); for (const a of ids.slice(1)) aliasesUsuarios.set(a,ids[0]); }
             for (const id of [participante.id, participante.jid, participante.phoneNumber]) {
                 if (id) registrarNomeUsuario(id, nome);
             }
@@ -737,6 +929,7 @@ function obterDadosPescador(id, nome) {
             moedas: 0,
             capturas: 0,
             maiorPeixe: 0,
+            marPesca: 'costa',
             peixes: [],
             equipamentos: { vara: 'basica', isca: 'comum', amuleto: 0, anel: 0, relicario: 0, pingente: 0, acelerador: 0, peso: 0 }
         };
@@ -753,6 +946,7 @@ function obterDadosPescador(id, nome) {
     if (!Array.isArray(jogador.itensEvento)) jogador.itensEvento = [];
     jogador.bonusSorteEvento = Math.max(0, Math.min(5, Number(jogador.bonusSorteEvento) || 0));
     jogador.renascimentos = Math.max(0, Number(jogador.renascimentos) || 0);
+    jogador.marPesca = MARES_PESCA?.[jogador.marPesca] ? jogador.marPesca : 'costa';
     jogador.bonusSorteRenascimento = Math.max(0, Number(jogador.bonusSorteRenascimento) || 0);
     jogador.bonusPesoRenascimento = Math.max(0, Number(jogador.bonusPesoRenascimento) || 0);
     if (!jogador.equipamentos || typeof jogador.equipamentos !== 'object') {
@@ -887,6 +1081,7 @@ function montarLojaPesca(id, nome) {
     const chances = calcularChancesPesca(jogador, eventoAtivo?.bonusSorte || 0);
     return `🎣 *LOJA DE PESCA*
 
+🌊 Mar atual: *${MARES_PESCA[obterMarPesca(jogador)].nome}*
 💰 Seu saldo: *${formatarWACoins(obterCarteira(id, nome).saldo)}*
 
 🧰 *EQUIPAMENTO ATUAL*
@@ -993,16 +1188,38 @@ function calcularPesoPesca(raridade) {
 }
 
 
+function obterEventoTematicoCalendario(data = new Date()) {
+    const iso = dataLocalISO(data);
+    const mmdd = iso.slice(5);
+    const eventos = [
+        { tipo:'natal', nome:'Natal dos Oceanos', emoji:'🎄', bonusSorte:6, inicio:'11-22', fim:'01-02', atravessaAno:true },
+        { tipo:'ano_novo', nome:'Virada das Marés', emoji:'🎆', bonusSorte:5, inicio:'01-02', fim:'01-08' },
+        { tipo:'carnaval', nome:'Carnaval Aquático', emoji:'🎭', bonusSorte:4, inicio:'02-10', fim:'02-18' },
+        { tipo:'pascoa', nome:'Páscoa Submarina', emoji:'🐰', bonusSorte:5, inicio:'03-20', fim:'04-05' },
+        { tipo:'junina', nome:'Arraiá das Águas', emoji:'🌽', bonusSorte:4, inicio:'06-10', fim:'07-01' },
+        { tipo:'primavera', nome:'Primavera Oceânica', emoji:'🌸', bonusSorte:4, inicio:'09-20', fim:'10-06' },
+        { tipo:'halloween', nome:'Halloween das Profundezas', emoji:'🎃', bonusSorte:5, inicio:'10-20', fim:'11-03' }
+    ];
+    for (const ev of eventos) {
+        let ativo = false;
+        if (ev.atravessaAno) ativo = mmdd >= ev.inicio || mmdd < ev.fim;
+        else ativo = mmdd >= ev.inicio && mmdd < ev.fim;
+        // Primeira edição de Natal começa em 22/11/2026 e termina em 02/01/2027.
+        if (ev.tipo === 'natal' && iso < '2026-11-22') ativo = false;
+        if (ativo) {
+            const anoFim = ev.atravessaAno && mmdd >= ev.inicio ? data.getFullYear()+1 : data.getFullYear();
+            const fim = new Date(`${anoFim}-${ev.fim}T00:00:00-03:00`).getTime();
+            return { ...ev, iniciadoEm: Date.now(), terminaEm: fim, tematico:true };
+        }
+    }
+    return null;
+}
+
 function obterEventoPescaAtivo() {
     const evento = carteirasWACoins.__evento_pesca;
-    if (!evento || !evento.terminaEm || Date.now() >= evento.terminaEm) {
-        if (evento) {
-            delete carteirasWACoins.__evento_pesca;
-            salvarWACoins().catch(() => {});
-        }
-        return null;
-    }
-    return evento;
+    if (evento && evento.terminaEm && Date.now() < evento.terminaEm) return evento;
+    if (evento) { delete carteirasWACoins.__evento_pesca; salvarWACoins().catch(() => {}); }
+    return obterEventoTematicoCalendario();
 }
 
 const PEIXES_EVENTO_PESCA = {
@@ -1025,6 +1242,42 @@ const PEIXES_EVENTO_PESCA = {
         { nome: 'Lula das Sombras', raridade: 'epico', valor: 1200 },
         { nome: 'Leviatã Corrompido', raridade: 'lendario', valor: 8000 },
         { nome: 'Coração do Abismo', raridade: 'divina', valor: 25000 }
+    ],
+    natal: [
+        { nome: 'Peixe-Presente', raridade: 'raro', valor: 1800 },
+        { nome: 'Rena-Marinha', raridade: 'epico', valor: 6500 },
+        { nome: 'Baleia Estrela de Natal', raridade: 'lendario', valor: 22000 },
+        { nome: 'Guardião do Polo Azul', raridade: 'divina', valor: 65000 }
+    ],
+    ano_novo: [
+        { nome: 'Peixe-Fogos de Artifício', raridade: 'epico', valor: 3500 },
+        { nome: 'Carpa da Virada', raridade: 'lendario', valor: 14000 },
+        { nome: 'Cometa de Ano Novo', raridade: 'divina', valor: 45000 }
+    ],
+    carnaval: [
+        { nome: 'Peixe-Máscara', raridade: 'raro', valor: 1200 },
+        { nome: 'Polvo do Samba', raridade: 'epico', valor: 5000 },
+        { nome: 'Rei Momo dos Mares', raridade: 'lendario', valor: 18000 }
+    ],
+    pascoa: [
+        { nome: 'Coelho-d água', raridade: 'raro', valor: 1400 },
+        { nome: 'Ovo de Coral', raridade: 'epico', valor: 5200 },
+        { nome: 'Lebre Dourada Abissal', raridade: 'lendario', valor: 19000 }
+    ],
+    junina: [
+        { nome: 'Sardinha Caipira', raridade: 'raro', valor: 1000 },
+        { nome: 'Pirarucu da Fogueira', raridade: 'epico', valor: 4800 },
+        { nome: 'Balão Celeste', raridade: 'lendario', valor: 17000 }
+    ],
+    primavera: [
+        { nome: 'Peixe-Pétala', raridade: 'raro', valor: 1300 },
+        { nome: 'Cavalo-marinho Florido', raridade: 'epico', valor: 4700 },
+        { nome: 'Jardim Vivo do Oceano', raridade: 'lendario', valor: 16500 }
+    ],
+    halloween: [
+        { nome: 'Peixe-Lanterna Assombrado', raridade: 'raro', valor: 1600 },
+        { nome: 'Lula Fantasma', raridade: 'epico', valor: 6000 },
+        { nome: 'Leviatã da Meia-Noite', raridade: 'divina', valor: 32000 }
     ]
 };
 
@@ -1079,14 +1332,137 @@ const PEIXES_PROFUNDIDADE = {
     }
 };
 
-function sortearPeixe(raridade, nivelLinha = 0) {
+const MARES_PESCA = {
+    costa: {
+        nome: 'Costa Inicial', emoji: '🏝️', renascimentos: 0, multiplicador: 1,
+        peixes: {
+            comum: [{nome:'Sardinha-dourada',valor:8},{nome:'Peixe-pedra',valor:10}],
+            incomum: [{nome:'Robalo-listrado',valor:45},{nome:'Garoupa-jovem',valor:55}],
+            raro: [{nome:'Raia-azul',valor:150},{nome:'Tubarão-de-recife',valor:180}],
+            epico: [{nome:'Tartaruga-coroada',valor:380}],
+            lendario: [{nome:'Rei das Ondas',valor:1200}],
+            divina: [{nome:'Espírito da Costa',valor:7000}]
+        }
+    },
+    tropical: {
+        nome: 'Mar Tropical', emoji: '🌴', renascimentos: 1, multiplicador: 1.6,
+        peixes: {
+            comum: [{nome:'Peixe-borboleta',valor:18},{nome:'Peixe-papagaio',valor:22}],
+            incomum: [{nome:'Moreia-dourada',valor:95},{nome:'Peixe-anjo-real',valor:110}],
+            raro: [{nome:'Manta-tropical',valor:330},{nome:'Tubarão-de-pontas-negras',valor:390}],
+            epico: [{nome:'Cavalo-marinho-imperial',valor:850}],
+            lendario: [{nome:'Dragão dos Recifes',valor:2800}],
+            divina: [{nome:'Deusa das Marés Tropicais',valor:16000}]
+        }
+    },
+    profundo: {
+        nome: 'Oceano Profundo', emoji: '🐋', renascimentos: 3, multiplicador: 2.6,
+        peixes: {
+            comum: [{nome:'Peixe-lanterna-pequeno',valor:35},{nome:'Enguia-prateada',valor:42}],
+            incomum: [{nome:'Peixe-machado-gigante',valor:180},{nome:'Lula-de-vidro',valor:210}],
+            raro: [{nome:'Quimera-marinha',valor:650},{nome:'Tubarão-cinzento-abissal',valor:780}],
+            epico: [{nome:'Lula-fantasma',valor:1900},{nome:'Baleia-sombria',valor:2300}],
+            lendario: [{nome:'Guardião da Fenda',valor:8500}],
+            divina: [{nome:'Olho do Oceano',valor:45000}]
+        }
+    },
+    abissal: {
+        nome: 'Mar Abissal', emoji: '🕳️', renascimentos: 5, multiplicador: 4.2,
+        peixes: {
+            comum: [{nome:'Peixe-cego-abissal',valor:55},{nome:'Camarão-fóssil',valor:65}],
+            incomum: [{nome:'Polvo-de-carvão',valor:300},{nome:'Peixe-dente-de-sabre',valor:360}],
+            raro: [{nome:'Peixe-dragão-negro',valor:1100},{nome:'Aranha-do-mar-gigante',valor:1350}],
+            epico: [{nome:'Serpente da Trincheira',valor:4200}],
+            lendario: [{nome:'Colosso do Vazio',valor:18000}],
+            divina: [{nome:'Coração do Abismo',valor:95000}]
+        }
+    },
+    celestial: {
+        nome: 'Mar Celestial', emoji: '🌌', renascimentos: 10, multiplicador: 7,
+        peixes: {
+            comum: [{nome:'Peixe-estelar',valor:90},{nome:'Medusa-luminosa',valor:110}],
+            incomum: [{nome:'Carpa-nebulosa',valor:520},{nome:'Enguia-celeste',valor:650}],
+            raro: [{nome:'Raia-cometa',valor:1800},{nome:'Tubarão-astral',valor:2200}],
+            epico: [{nome:'Baleia das Constelações',valor:8000}],
+            lendario: [{nome:'Imperador das Galáxias',valor:42000}],
+            divina: [{nome:'Criador do Mar Celestial',valor:220000}]
+        }
+    },
+    infinito: {
+        nome: 'Mar do Infinito', emoji: '♾️', renascimentos: 15, multiplicador: 12,
+        peixes: {
+            comum: [{nome:'Fragmento-vivo do Infinito',valor:150},{nome:'Peixe-dimensional',valor:180}],
+            incomum: [{nome:'Serpente entre Mundos',valor:900},{nome:'Náutilo eterno',valor:1100}],
+            raro: [{nome:'Leviatã dimensional',valor:3600},{nome:'Tubarão do Vazio',valor:4300}],
+            epico: [{nome:'Devorador de Horizontes',valor:16000}],
+            lendario: [{nome:'O Primeiro Leviatã',valor:90000}],
+            divina: [{nome:'O Infinito Azul',valor:500000}]
+        }
+    }
+};
+
+const pendingRenascimentosPesca = new Map();
+
+function obterMarPesca(jogador) {
+    const chave = String(jogador?.marPesca || 'costa');
+    return MARES_PESCA[chave] ? chave : 'costa';
+}
+
+function montarListaMaresPesca(jogador) {
+    const renascimentos = Number(jogador.renascimentos) || 0;
+    const atual = obterMarPesca(jogador);
+    const linhas = Object.entries(MARES_PESCA).map(([id, mar]) => {
+        const desbloqueado = renascimentos >= mar.renascimentos;
+        const marcador = id === atual ? '📍' : desbloqueado ? '✅' : '🔒';
+        return `${marcador} *${mar.nome}* — ${mar.renascimentos} renascimento(s)${desbloqueado ? ` | x${mar.multiplicador} no valor` : ` | faltam ${mar.renascimentos - renascimentos}`}`;
+    });
+    return `🌊 *MAPA DOS MARES*\n\nRenascimentos: *${renascimentos}*\nMar atual: *${MARES_PESCA[atual].nome}*\n\n${linhas.join('\n')}\n\nPara viajar: *!mar nome* (ex.: !mar tropical).`;
+}
+
+async function selecionarMarPesca(sock, jid, id, nome, argumento) {
+    const jogador = obterDadosPescador(id, nome);
+    const chave = normalizar(argumento || '');
+    if (!chave) return texto(sock, jid, montarListaMaresPesca(jogador));
+    const aliases = {
+        costa:'costa', inicial:'costa', tropical:'tropical', profundo:'profundo', oceano:'profundo',
+        abissal:'abissal', celestial:'celestial', infinito:'infinito'
+    };
+    const marId = aliases[chave];
+    if (!marId || !MARES_PESCA[marId]) return texto(sock, jid, `❌ Mar não encontrado.\n\n${montarListaMaresPesca(jogador)}`);
+    const mar = MARES_PESCA[marId];
+    if ((Number(jogador.renascimentos) || 0) < mar.renascimentos) {
+        return texto(sock, jid, `🔒 *${mar.nome} BLOQUEADO*\n\nNecessário: ${mar.renascimentos} renascimento(s).\nVocê possui: ${jogador.renascimentos || 0}.\n\nUse !renascerpesca para evoluir.`);
+    }
+    jogador.marPesca = marId;
+    await salvarDadosPesca();
+    return texto(sock, jid, `${mar.emoji} *VIAGEM CONCLUÍDA!*\n\nVocê agora está pescando em *${mar.nome}*.\n💰 Valor dos peixes: multiplicador x${mar.multiplicador}.\n🎣 Use !pescar para começar.`);
+}
+
+function obterRequisitosRenascimentoPesca(jogador) {
+    const proximo = (Number(jogador.renascimentos) || 0) + 1;
+    return {
+        numero: proximo,
+        capturas: 100 + (proximo - 1) * 50,
+        peixes: 10 + (proximo - 1) * 5,
+        dinheiro: Math.round(5000 * Math.pow(1.55, proximo - 1))
+    };
+}
+
+function obterChaveCarteiraUsuario(id) {
+    if (carteirasWACoins[id]) return id;
+    return Object.keys(carteirasWACoins).find(chave => !chave.startsWith('__') && mesmoUsuario(chave, id)) || id;
+}
+
+function sortearPeixe(raridade, nivelLinha = 0, jogador = null) {
     const profundidade = Math.max(0, Math.min(5, Number(nivelLinha) || 0));
     const extras = [];
     for (let nivel = 2; nivel <= profundidade; nivel++) {
         const lista = PEIXES_PROFUNDIDADE[nivel]?.[raridade] || [];
         extras.push(...lista);
     }
-    return aleatorio([...(peixesDisponiveis[raridade] || []), ...extras]);
+    const mar = MARES_PESCA[obterMarPesca(jogador)];
+    const peixesDoMar = mar?.peixes?.[raridade] || [];
+    return aleatorio([...(peixesDisponiveis[raridade] || []), ...extras, ...peixesDoMar]);
 }
 
 function obterTempoRestantePesca(id, jogador) {
@@ -1160,13 +1536,15 @@ async function pescar(sock, jid, id, nome) {
         const capturaEvento = evento && randomInt(1, 101) <= 12;
         const peixeEvento = capturaEvento ? aleatorio(peixesEvento) : null;
         const raridade = peixeEvento?.raridade || raridadeBase;
-        const peixe = peixeEvento || sortearPeixe(raridade, jogador.equipamentos.linha);
+        const peixe = peixeEvento || sortearPeixe(raridade, jogador.equipamentos.linha, jogador);
+        const marAtual = MARES_PESCA[obterMarPesca(jogador)];
+        const valorPeixeMar = Math.round((Number(peixe.valor) || 0) * (marAtual?.multiplicador || 1));
         const pesoBase = calcularPesoPesca(raridade);
         const bonusProfundidade = 1 + (Math.max(0, Number(jogador.equipamentos.linha) || 0) * 0.12);
         const peso = Math.round(pesoBase * bonusProfundidade * (1 + calcularBonusPesoPesca(jogador)));
 
         const bonusPeso = Math.floor(peso / 100);
-        const moedasGanhas = peixe.valor + bonusPeso;
+        const moedasGanhas = valorPeixeMar + bonusPeso;
 
         const captura = {
             nome: peixe.nome,
@@ -1181,13 +1559,27 @@ async function pescar(sock, jid, id, nome) {
 
         jogador.peixes.push(captura);
         jogador.capturas++;
+        const chaveTripulacao = encontrarChaveUsuario(sistemasV310.membrosTripulacao || {}, id);
+        const tripulacao = chaveTripulacao ? sistemasV310.tripulacoes?.[sistemasV310.membrosTripulacao[chaveTripulacao]] : null;
+        if (tripulacao) {
+            tripulacao.pontos = (Number(tripulacao.pontos) || 0) + Math.max(1, Math.floor(moedasGanhas / 10));
+            tripulacao.capturas = (Number(tripulacao.capturas) || 0) + 1;
+            tripulacao.ultimaCapturaEm = Date.now();
+        }
         let itemEventoRecebido = null;
         if (evento && randomInt(1, 101) <= 18) {
             const catalogoItensEvento = {
                 taco: { nome: 'Amuleto Taco', bonusSorte: 1 },
                 mare: { nome: 'Amuleto da Maré', bonusSorte: 1 },
                 estrelas: { nome: 'Fragmento Estelar', bonusSorte: 1 },
-                abismo: { nome: 'Relíquia Abissal', bonusSorte: 1 }
+                abismo: { nome: 'Relíquia Abissal', bonusSorte: 1 },
+                natal: { nome: 'Estrela de Natal', bonusSorte: 1 },
+                ano_novo: { nome: 'Fragmento da Virada', bonusSorte: 1 },
+                carnaval: { nome: 'Máscara Oceânica', bonusSorte: 1 },
+                pascoa: { nome: 'Ovo de Coral', bonusSorte: 1 },
+                junina: { nome: 'Fogueira Azul', bonusSorte: 1 },
+                primavera: { nome: 'Pétala Marinha', bonusSorte: 1 },
+                halloween: { nome: 'Essência Assombrada', bonusSorte: 1 }
             };
             itemEventoRecebido = { ...(catalogoItensEvento[evento.tipo] || catalogoItensEvento.mare), data: Date.now() };
             jogador.itensEvento ||= [];
@@ -1201,7 +1593,7 @@ async function pescar(sock, jid, id, nome) {
             jogador.maiorPeixe = peso;
         }
 
-        await salvarDadosPesca();
+        await Promise.all([salvarDadosPesca(), salvarSistemas310()]);
 
         const infoRaridade = raridadesPesca[raridade];
 
@@ -1223,6 +1615,7 @@ async function pescar(sock, jid, id, nome) {
             `🎣 *PESCARIA CONCLUÍDA!*
 
 👤 Pescador: ${nome}
+🌊 Mar: ${marAtual.nome}
 
 ${infoRaridade.emoji} Raridade: *${infoRaridade.nome}*
 🐟 Peixe: *${peixe.nome}*
@@ -1251,7 +1644,7 @@ function montarColecaoPesca(id, nome) {
         const itensEvento = jogador.itensEvento?.length
             ? `\n\n🎁 *ITENS DE EVENTO*\n${jogador.itensEvento.map(item => `• ${item.nome}`).join('\n')}\n🍀 Bônus permanente de sorte: +${jogador.bonusSorteEvento}/5`
             : '';
-        return `🎣 *COLEÇÃO DE ${jogador.nome.toUpperCase()}*\n\nVocê ainda não capturou nenhum peixe.\n\nUse !pescar para começar!${itensEvento}`;
+        return `🎣 *COLEÇÃO DE ${jogador.nome.toUpperCase()}*\n🌊 Mar atual: ${MARES_PESCA[obterMarPesca(jogador)].nome}\n\nVocê ainda não capturou nenhum peixe.\n\nUse !pescar para começar!${itensEvento}`;
     }
 
     const contagem = {};
@@ -1278,6 +1671,7 @@ function montarColecaoPesca(id, nome) {
     const valorDisponivel = disponiveisVenda.reduce((soma, peixe) => soma + Math.max(0, Number(peixe.valor) || 0), 0);
 
     return `🎣 *COLEÇÃO DE ${jogador.nome.toUpperCase()}*
+🌊 Mar atual: ${MARES_PESCA[obterMarPesca(jogador)].nome}
 
 ${lista}
 
@@ -1396,7 +1790,7 @@ async function gerarImagemRankingPesca() {
       ${linhas || '<text x="512" y="520" text-anchor="middle" font-family="DejaVu Sans, Noto Sans, Noto Color Emoji, sans-serif" font-size="28" fill="#FFFFFF">Nenhum pescador registrado</text>'}
       <text x="512" y="925" text-anchor="middle" font-family="DejaVu Sans, Noto Sans, Noto Color Emoji, sans-serif" font-size="15" letter-spacing="3" fill="#78A9C0">PESQUE • COLECIONE • EVOLUA</text>
     </svg>`;
-    return sharp(Buffer.from(svg)).png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer();
+    return sharp(Buffer.from(aplicarMolduraNatalSVG(svg))).png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer();
 }
 
 function obterPersonalizacao(id) {
@@ -1696,11 +2090,54 @@ function montarInventarioPerfil(id) {
 }
 
 // ==================================================
+// PERSISTÊNCIA AGRUPADA DO HISTÓRICO DE MENSAGENS
+// ==================================================
+
+function agendarSalvamentoMensagens() {
+    mensagensPrecisamSalvar = true;
+    if (timerSalvarMensagens) clearTimeout(timerSalvarMensagens);
+    timerSalvarMensagens = setTimeout(() => {
+        timerSalvarMensagens = null;
+        salvarMensagensPendente().catch(erro => console.error('[PERSISTÊNCIA] Falha ao salvar histórico de mensagens:', erro?.stack || erro));
+    }, INTERVALO_DEBOUNCE_MENSAGENS);
+    timerSalvarMensagens.unref?.();
+}
+
+async function salvarMensagensPendente() {
+    if (salvandoMensagens) return promessaSalvarMensagens;
+    if (timerSalvarMensagens) { clearTimeout(timerSalvarMensagens); timerSalvarMensagens = null; }
+    if (!mensagensPrecisamSalvar) return;
+    salvandoMensagens = true;
+    mensagensPrecisamSalvar = false;
+    const tarefa = (async () => {
+        try {
+            await salvarJSON(ARQUIVO_MENSAGENS, mensagensComando);
+        } catch (erro) {
+            mensagensPrecisamSalvar = true;
+            throw erro;
+        } finally {
+            salvandoMensagens = false;
+            promessaSalvarMensagens = null;
+            if (mensagensPrecisamSalvar && !timerSalvarMensagens) {
+                timerSalvarMensagens = setTimeout(() => {
+                    timerSalvarMensagens = null;
+                    salvarMensagensPendente().catch(erro => console.error('[PERSISTÊNCIA] Falha ao repetir gravação:', erro?.message || erro));
+                }, 2000);
+                timerSalvarMensagens.unref?.();
+            }
+        }
+    })();
+    promessaSalvarMensagens = tarefa;
+    return tarefa;
+}
+
+// ==================================================
 // ENVIO DE MENSAGENS
 // ==================================================
 
 async function enviar(sock, jid, conteudo, registrar = true) {
-    const enviada = await sock.sendMessage(jid, conteudo);
+    const conteudoDecorado = decorarSaidaWABOT(conteudo, jid);
+    const enviada = await sock.sendMessage(jid, conteudoDecorado);
 
     if (registrar && enviada?.key?.id) {
         if (!mensagensComando[jid]) {
@@ -1708,9 +2145,16 @@ async function enviar(sock, jid, conteudo, registrar = true) {
         }
 
         mensagensComando[jid].push(enviada.key);
-        mensagensComando[jid] = mensagensComando[jid].slice(-500);
+        mensagensComando[jid] = mensagensComando[jid].slice(-MAX_MENSAGENS_HISTORICO_POR_CONVERSA);
 
-        await salvarJSON(ARQUIVO_MENSAGENS, mensagensComando);
+        // Não bloqueia a resposta do WhatsApp esperando a regravação do JSON inteiro.
+        // Várias mensagens são agrupadas em uma única gravação curta.
+        const conversas = Object.keys(mensagensComando);
+        while (conversas.length > MAX_CONVERSAS_HISTORICO) {
+            const antiga = conversas.shift();
+            if (antiga !== jid) delete mensagensComando[antiga];
+        }
+        agendarSalvamentoMensagens();
     }
 
     return enviada;
@@ -1772,7 +2216,8 @@ async function limparMensagens(sock, jid, quantidade) {
 
     mensagensComando[jid] = [...restantes, ...falhas];
 
-    await salvarJSON(ARQUIVO_MENSAGENS, mensagensComando);
+    mensagensPrecisamSalvar = true;
+    await salvarMensagensPendente();
 
     return {
         apagadas,
@@ -1992,7 +2437,7 @@ async function gerarImagemRanking() {
     return sharp(IMAGEM_RANKING)
         .resize(largura, altura)
         .composite([{
-            input: Buffer.from(svg),
+            input: Buffer.from(aplicarMolduraNatalSVG(svg)),
             top: 0,
             left: 0
         }])
@@ -2269,7 +2714,7 @@ async function gerarImagemPerfil(sock, id, nome) {
       <text x="550" y="754" text-anchor="middle" font-family="DejaVu Sans, Noto Sans, Noto Color Emoji, sans-serif" font-size="13" letter-spacing="2" fill="#AEB8DE">WABOT • CARTÃO DE JOGADOR</text>
     </svg>`;
 
-    const base = await sharp(Buffer.from(svg)).png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer();
+    const base = await sharp(Buffer.from(aplicarMolduraNatalSVG(svg))).png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer();
     return sharp(base).composite([{ input: avatar, left: 131, top: 219 }]).png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer();
 }
 
@@ -2330,7 +2775,7 @@ async function gerarImagemConquistas(id, nome) {
       ${cards}
       <text x="${largura/2}" y="${altura-48}" text-anchor="middle" font-family="DejaVu Sans, Noto Sans, Noto Color Emoji, sans-serif" font-size="14" letter-spacing="3" fill="#8CA9C2">JOGUE • EVOLUA • DESBLOQUEIE</text>
     </svg>`;
-    return sharp(Buffer.from(svg)).png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer();
+    return sharp(Buffer.from(aplicarMolduraNatalSVG(svg))).png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer();
 }
 
 function quebrarTextoSVG(texto, limite = 48, maxLinhas = 4) {
@@ -2396,7 +2841,7 @@ async function gerarImagemDivulgacao(tipo, titulo, descricao, chamada) {
       <text x="540" y="827" text-anchor="middle" font-family="DejaVu Sans, Noto Sans, Noto Color Emoji, sans-serif" font-size="30" font-weight="bold" letter-spacing="2" fill="#FFFFFF">${chamadaSegura}</text>
       <text x="540" y="956" text-anchor="middle" font-family="DejaVu Sans, Noto Sans, Noto Color Emoji, sans-serif" font-size="17" letter-spacing="5" fill="#8FB4C9">COMPARTILHE • CONECTE • PARTICIPE</text>
     </svg>`;
-    return sharp(Buffer.from(svg)).png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer();
+    return sharp(Buffer.from(aplicarMolduraNatalSVG(svg))).png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer();
 }
 
 // ==================================================
@@ -2512,12 +2957,24 @@ function montarResultadoEnquete(sock, enquete) {
 // RPG INDEPENDENTE (economia e progresso separados)
 // ==================================================
 
+const RPG_CLASSES = {
+    guerreiro: { nome: 'Guerreiro', passiva: '+12% de dano físico', habilidade: 'Fúria: próximo ataque causa 75% de dano adicional.' },
+    mago: { nome: 'Mago', passiva: '+15% de poder mágico', habilidade: 'Sobrecarga: próxima magia recebe +50% de poder.' },
+    guardiao: { nome: 'Guardião', passiva: '+15% de defesa efetiva', habilidade: 'Barreira: reduz em 65% o próximo dano recebido durante 1 minuto.' },
+    ladino: { nome: 'Ladino', passiva: '15% de chance de causar dano crítico', habilidade: 'Emboscada: garante crítico no próximo ataque.' }
+};
+
 const RPG_INIMIGOS = [
     { nome: 'Slime da Floresta', hp: 32, ataque: 7, defesa: 1, xp: 22, moedas: 14, habilidade: 'Ácido viscoso' },
     { nome: 'Lobo Cinzento', hp: 46, ataque: 10, defesa: 2, xp: 32, moedas: 22, habilidade: 'Investida feroz' },
     { nome: 'Goblin Saqueador', hp: 58, ataque: 12, defesa: 3, xp: 42, moedas: 30, habilidade: 'Golpe oportunista' },
     { nome: 'Golem de Pedra', hp: 85, ataque: 15, defesa: 6, xp: 65, moedas: 48, habilidade: 'Pele de pedra' },
-    { nome: 'Cavaleiro Esquecido', hp: 110, ataque: 19, defesa: 7, xp: 90, moedas: 70, habilidade: 'Corte espectral' }
+    { nome: 'Cavaleiro Esquecido', hp: 110, ataque: 19, defesa: 7, xp: 90, moedas: 70, habilidade: 'Corte espectral' },
+    { nome: 'Hidra de Três Ecos', hp: 165, ataque: 25, defesa: 9, xp: 145, moedas: 125, habilidade: 'Mordida tripla', estilo:'agressivo' },
+    { nome: 'Mímico Ancestral', hp: 190, ataque: 22, defesa: 14, xp: 170, moedas: 155, habilidade: 'Armadilha de ouro', estilo:'tatico' },
+    { nome: 'Arcanjo Corrompido', hp: 230, ataque: 31, defesa: 12, xp: 220, moedas: 210, habilidade: 'Lança celestial', estilo:'arcano' },
+    { nome: 'Devorador de Mundos', hp: 310, ataque: 36, defesa: 16, xp: 300, moedas: 290, habilidade: 'Fome do vazio', estilo:'venenoso' },
+    { nome: 'Rei das Profundezas', hp: 420, ataque: 43, defesa: 20, xp: 420, moedas: 400, habilidade: 'Maré devastadora', estilo:'agressivo' }
 ];
 
 const RPG_ITENS = {
@@ -2527,6 +2984,8 @@ const RPG_ITENS = {
     espada_lunar: { nome: 'Espada lunar', preco: 280, tipo: 'arma', ataque: 12 },
     escudo: { nome: 'Escudo de ferro', preco: 120, tipo: 'armadura', defesa: 4 },
     escudo_real: { nome: 'Escudo real', preco: 320, tipo: 'armadura', defesa: 9 },
+    espada_runica: { nome: 'Espada rúnica', preco: 0, tipo: 'arma', ataque: 20 },
+    escudo_cristal: { nome: 'Escudo de cristal', preco: 0, tipo: 'armadura', defesa: 16 },
     liberador: { nome: 'Liberador de poder', preco: 650, tipo: 'consumivel', efeito: 'roleta' }
 };
 
@@ -2536,9 +2995,10 @@ function obterJogadorRPG(id, nome) {
             nome, nivel: 1, xp: 0, moedas: 50,
             hp: 100, hpMax: 100, ataque: 10, defesa: 2, pontosEvolucao: 0, evolucoes: { ataque: 0, defesa: 0, vida: 0, magia: 0 },
             inventario: { pocao: 2, liberador: 0 }, equipamento: { arma: null, armadura: null },
-            magias: [], poderCopiado: null, zumbi: null,
+            magias: [], poderCopiado: null, zumbi: null, classe: null, habilidadeCooldownAte: 0, bonusProximoAtaque: 1, bonusProximaMagia: 1,
+            bonusProximoAtaqueAte: 0, bonusProximaMagiaAte: 0, escudoClasseAte: 0, criticoGarantidoAte: 0, escudoPoliticoAte: 0,
             inimigo: null, progresso: { exploracoes: 0, vitorias: 0, missoesConcluidas: 0 },
-            missao: { tipo: 'explorar', meta: 3, progresso: 0, recompensa: 45, xp: 35 }
+            missao: { tipo: 'explorar', meta: 3, progresso: 0, recompensa: 120, xp: 90 }
         };
     }
     const p = dadosRPG[id];
@@ -2555,13 +3015,36 @@ function obterJogadorRPG(id, nome) {
     p.evolucoes ||= { ataque: 0, defesa: 0, vida: 0, magia: 0 };
     for (const chave of ['ataque','defesa','vida','magia']) p.evolucoes[chave] = Math.max(0, Number(p.evolucoes[chave]) || 0);
     p.inventario ||= { pocao: 0 };
+    p.inventario.fragmento_arcano = Math.max(0, Number(p.inventario.fragmento_arcano) || 0);
+    p.inventario.nucleo_abissal = Math.max(0, Number(p.inventario.nucleo_abissal) || 0);
+    p.masmorra ||= { melhorAndar: 0, vitorias: 0, tentativasDia: 0, dataTentativas: '', comprasDia: 0, dataCompras: '' };
+    p.masmorra.comprasDia = Math.max(0, Number(p.masmorra.comprasDia) || 0);
+    p.masmorra.dataCompras = String(p.masmorra.dataCompras || '');
+    p.masmorra.acessosExtras = Math.max(0, Number(p.masmorra.acessosExtras) || 0);
     p.inventario.liberador = Math.max(0, Number(p.inventario.liberador) || 0);
     p.equipamento ||= { arma: null, armadura: null };
     if (!Array.isArray(p.magias)) p.magias = [];
     p.poderCopiado ||= null;
     p.zumbi ||= null;
+    p.classe = ['guerreiro','mago','guardiao','ladino'].includes(p.classe) ? p.classe : null;
+    p.habilidadeCooldownAte = Math.max(0, Number(p.habilidadeCooldownAte) || 0);
+    p.bonusProximoAtaque = Math.max(1, Number(p.bonusProximoAtaque) || 1);
+    p.bonusProximaMagia = Math.max(1, Number(p.bonusProximaMagia) || 1);
+    p.bonusProximoAtaqueAte = Math.max(0, Number(p.bonusProximoAtaqueAte) || 0);
+    p.bonusProximaMagiaAte = Math.max(0, Number(p.bonusProximaMagiaAte) || 0);
+    p.escudoClasseAte = Math.max(0, Number(p.escudoClasseAte) || 0);
+    p.criticoGarantidoAte = Math.max(0, Number(p.criticoGarantidoAte) || 0);
+    p.escudoPoliticoAte = Math.max(0, Number(p.escudoPoliticoAte) || 0);
     p.progresso ||= { exploracoes: 0, vitorias: 0, missoesConcluidas: 0 };
-    p.missao ||= { tipo: 'explorar', meta: 3, progresso: 0, recompensa: 45, xp: 35 };
+    p.missao ||= { tipo: 'explorar', meta: 3, progresso: 0, recompensa: 120, xp: 90 };
+    // Economia rural e construção: migração aditiva, sem apagar dados antigos.
+    p.economia ||= {};
+    p.economia.fazendas = Math.max(0, Math.min(3, Number(p.economia.fazendas) || 0));
+    p.economia.plantacao ||= null;
+    p.economia.emprego ||= null;
+    p.economia.trabalhoAte = Math.max(0, Number(p.economia.trabalhoAte) || 0);
+    p.economia.recursos ||= { madeira: 0, pedra: 0, trigo: 0, ervas: 0 };
+    for (const recurso of ['madeira','pedra','trigo','ervas']) p.economia.recursos[recurso] = Math.max(0, Number(p.economia.recursos[recurso]) || 0);
     return p;
 }
 
@@ -2643,12 +3126,13 @@ function sortearMagiaRPG(magiasAdquiridas = []) {
 
 function obterMultiplicadorMagiaRPG(j) {
     const pacto = j.magias.find(id => id === 'pacto_da_lua' || id === 'pacto_do_sol');
-    if (!pacto) return 1 + (Math.max(0, Number(j.evolucoes?.magia) || 0) * 0.05);
+    if (!pacto) return (1 + (Math.max(0, Number(j.evolucoes?.magia) || 0) * 0.05)) * (j.classe === 'mago' ? 1.15 : 1);
     const bonusEvolucao = 1 + (Math.max(0, Number(j.evolucoes?.magia) || 0) * 0.05);
+    const bonusClasse = j.classe === 'mago' ? 1.15 : 1;
     const hora = new Date().getHours();
     const dia = hora >= 7 && hora < 18;
-    if (pacto === 'pacto_da_lua') return (dia ? 0.88 : 1.20) * bonusEvolucao;
-    return (dia ? 1.20 : 0.88) * bonusEvolucao;
+    if (pacto === 'pacto_da_lua') return (dia ? 0.88 : 1.20) * bonusEvolucao * bonusClasse;
+    return (dia ? 1.20 : 0.88) * bonusEvolucao * bonusClasse;
 }
 
 function listarMagiasRPG(j) {
@@ -2661,12 +3145,15 @@ function listarMagiasRPG(j) {
 async function usarMagiaRPG(j, nomeMagia) {
     const chave = normalizar(nomeMagia).replace(/\s+/g, '_');
     const magia = RPG_MAGIAS[chave];
+    const bonusTemporario = Date.now() < (j.bonusProximaMagiaAte || 0) ? (Number(j.bonusProximaMagia) || 1) : 1;
+    const multiplicadorMagia = obterMultiplicadorMagiaRPG(j) * bonusTemporario;
     if (!magia) return 'Magia não reconhecida. Use !rpg magias.';
     if (!j.magias.includes(chave)) return 'Você ainda não desbloqueou essa magia. Use um Liberador de poder.';
+    if (bonusTemporario > 1) { j.bonusProximaMagia = 1; j.bonusProximaMagiaAte = 0; }
     if (j.hp <= 0) return 'Seu personagem precisa estar vivo para conjurar.';
     if (chave === 'bola_de_fogo') {
         if (!j.inimigo) return 'Bola de fogo: não há inimigo em combate. Explore primeiro.';
-        const dano = Math.max(1, Math.round((j.ataque * 2.4 + 18) * obterMultiplicadorMagiaRPG(j)));
+        const dano = Math.max(1, Math.round((j.ataque * 2.4 + 18) * multiplicadorMagia));
         j.inimigo.hp -= dano;
         if (j.inimigo.hp <= 0) {
             const derrotado = j.inimigo;
@@ -2681,14 +3168,14 @@ async function usarMagiaRPG(j, nomeMagia) {
         return `🔥 Você criou uma bola de fogo de 1 m × 1 m!\n💥 Dano: ${dano}\n👹 ${j.inimigo.nome}: ${j.inimigo.hp}/${j.inimigo.hpMax} HP.`;
     }
     if (chave === 'agua') {
-        const cura = Math.round(20 * obterMultiplicadorMagiaRPG(j));
+        const cura = Math.round(20 * multiplicadorMagia);
         const antes = j.hp;
         j.hp = Math.min(j.hpMax, j.hp + cura);
         if (j.inimigo) j.inimigo.proximoAtaqueReduzido = true;
         return `💧 Você criou e moveu água em uma área de 1 m × 1 m.\n🛡️ A água desviou parte do perigo e recuperou ${j.hp - antes} HP.`;
     }
     if (chave === 'plantificar') {
-        const cura = Math.round(30 * obterMultiplicadorMagiaRPG(j));
+        const cura = Math.round(30 * multiplicadorMagia);
         const antes = j.hp;
         j.hp = Math.min(j.hpMax, j.hp + cura);
         if (j.inimigo) j.inimigo.atordoado = true;
@@ -2705,7 +3192,7 @@ async function usarMagiaRPG(j, nomeMagia) {
         return `☠️ *NECROMANCIA!*\n${j.zumbi.nome} foi invocado como aliado. Ele lutará ao seu lado por até 3 turnos.`;
     }
     if (chave === 'pacto_da_lua' || chave === 'pacto_do_sol') {
-        const multiplicador = obterMultiplicadorMagiaRPG(j);
+        const multiplicador = multiplicadorMagia;
         const fase = new Date().getHours() >= 7 && new Date().getHours() < 18 ? 'dia' : 'noite';
         return `🌙 Você ativou ${magia.nome}.\n☀️ Período atual: ${fase}.\n⚡ Poder atual: ${Math.round(multiplicador * 100)}% (bônus/penalidade aplicado automaticamente).`;
     }
@@ -2713,7 +3200,7 @@ async function usarMagiaRPG(j, nomeMagia) {
 }
 
 function statusRPG(j) {
-    return `🧭 *${j.nome.toUpperCase()} — AVENTUREIRO*\n\n⭐ Nível: ${j.nivel}\n✨ XP: ${j.xp}/${xpNecessarioRPG(j.nivel)}\n❤️ Vida: ${j.hp}/${j.hpMax}\n⚔️ Ataque: ${j.ataque}\n🛡️ Defesa: ${j.defesa}\n🌳 Pontos de evolução: ${j.pontosEvolucao||0}\n🪙 Moedas RPG: ${j.moedas}\n🔮 Magias: ${j.magias.length ? j.magias.map(id => RPG_MAGIAS[id]?.nome || id).join(', ') : 'Nenhuma'}\n⚡ Poder atual: ${Math.round(obterMultiplicadorMagiaRPG(j) * 100)}%\n☠️ Aliado: ${j.zumbi ? `${j.zumbi.nome} (${j.zumbi.vida} turnos)` : 'Nenhum'}\n\n🏆 Vitórias: ${j.progresso.vitorias}\n🗺️ Explorações: ${j.progresso.exploracoes}\n📜 Missões concluídas: ${j.progresso.missoesConcluidas}\n⚔️ Combate: ${j.inimigo ? j.inimigo.nome + ' (' + j.inimigo.hp + ' HP)' : 'Nenhum'}`;
+    return `🧭 *${j.nome.toUpperCase()} — AVENTUREIRO*\n\n⭐ Nível: ${j.nivel}\n✨ XP: ${j.xp}/${xpNecessarioRPG(j.nivel)}\n❤️ Vida: ${j.hp}/${j.hpMax}\n⚔️ Ataque: ${j.ataque}\n🛡️ Defesa: ${j.defesa}\n🌳 Pontos de evolução: ${j.pontosEvolucao||0}\n🪙 Moedas RPG: ${j.moedas}\n🧬 Classe: ${j.classe ? RPG_CLASSES[j.classe].nome : 'Não escolhida'}\n🔮 Magias: ${j.magias.length ? j.magias.map(id => RPG_MAGIAS[id]?.nome || id).join(', ') : 'Nenhuma'}\n⚡ Poder atual: ${Math.round(obterMultiplicadorMagiaRPG(j) * 100)}%\n☠️ Aliado: ${j.zumbi ? `${j.zumbi.nome} (${j.zumbi.vida} turnos)` : 'Nenhum'}\n\n🏆 Vitórias: ${j.progresso.vitorias}\n🗺️ Explorações: ${j.progresso.exploracoes}\n📜 Missões concluídas: ${j.progresso.missoesConcluidas}\n⚔️ Combate: ${j.inimigo ? j.inimigo.nome + ' (' + j.inimigo.hp + ' HP)' : 'Nenhum'}`;
 }
 
 function svgTexto(texto) { return escaparSVG(texto); }
@@ -2728,7 +3215,7 @@ async function gerarImagemArvoreRPG(j) {
     ];
     const cards = nos.map(n => `<path d="M400 125 L${n.x} ${n.y-55}" stroke="${n.cor}" stroke-width="5" opacity=".75"/><rect x="${n.x-105}" y="${n.y-55}" width="210" height="125" rx="20" fill="#17243d" stroke="${n.cor}" stroke-width="4"/><circle cx="${n.x}" cy="${n.y-20}" r="18" fill="${n.cor}"/><text x="${n.x}" y="${n.y+15}" text-anchor="middle" fill="#fff" font-size="20" font-weight="bold">${n.nome}</text><text x="${n.x}" y="${n.y+42}" text-anchor="middle" fill="#d8e4ff" font-size="16">Nível ${n.nivel} • ${n.desc}</text>`).join('');
     const svg = `<svg width="800" height="620" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#10182c"/><stop offset="1" stop-color="#202c4a"/></linearGradient></defs><rect width="800" height="620" fill="url(#bg)"/><text x="400" y="55" text-anchor="middle" fill="#fff" font-size="32" font-weight="bold">ÁRVORE DE EVOLUÇÃO</text><text x="400" y="88" text-anchor="middle" fill="#b8c8e8" font-size="18">${svgTexto(j.nome)} • Nível ${j.nivel}</text><rect x="290" y="105" width="220" height="65" rx="18" fill="#26385b" stroke="#f5d36b" stroke-width="3"/><text x="400" y="132" text-anchor="middle" fill="#f5d36b" font-size="17" font-weight="bold">NÚCLEO</text><text x="400" y="154" text-anchor="middle" fill="#fff" font-size="15">${j.pontosEvolucao||0} ponto(s) disponível(is)</text>${cards}<text x="400" y="580" text-anchor="middle" fill="#d8e4ff" font-size="17">!rpg evoluir ataque | defesa | vida | magia</text></svg>`;
-    return sharp(Buffer.from(svg)).png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer();
+    return sharp(Buffer.from(aplicarMolduraNatalSVG(svg))).png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer();
 }
 
 async function evoluirRPG(j, ramo) {
@@ -2750,7 +3237,7 @@ function criarImagemRoletaPremio(premio, nome) {
     const rotulos = ['10','25','50','75','100','150'];
     const setores = rotulos.map((v,i) => { const a1=i*Math.PI/3, a2=(i+1)*Math.PI/3; const x1=400+230*Math.sin(a1), y1=300-230*Math.cos(a1); const x2=400+230*Math.sin(a2), y2=300-230*Math.cos(a2); const tx=400+145*Math.sin((i+.5)*Math.PI/3), ty=300-145*Math.cos((i+.5)*Math.PI/3); return `<path d="M400 300 L${x1} ${y1} A230 230 0 0 1 ${x2} ${y2} Z" fill="${fatias[i]}" stroke="#fff" stroke-width="4"/><text x="${tx}" y="${ty}" text-anchor="middle" dominant-baseline="middle" fill="#fff" font-size="30" font-weight="bold">${v}</text>`; }).join('');
     const svg = `<svg width="800" height="700" xmlns="http://www.w3.org/2000/svg"><rect width="800" height="700" fill="#10182c"/><text x="400" y="55" text-anchor="middle" fill="#fff" font-size="34" font-weight="bold">RODA DA SORTE WABOT</text><text x="400" y="88" text-anchor="middle" fill="#c8d6f0" font-size="18">Giro diário gratuito • sem apostas</text><g>${setores}</g><path d="M400 42 L375 95 L425 95 Z" fill="#fff" stroke="#f5d36b" stroke-width="4"/><circle cx="400" cy="300" r="48" fill="#17243d" stroke="#fff" stroke-width="5"/><text x="400" y="310" text-anchor="middle" fill="#fff" font-size="25" font-weight="bold">W</text><rect x="115" y="570" width="570" height="80" rx="20" fill="#26385b"/><text x="400" y="605" text-anchor="middle" fill="#f5d36b" font-size="22" font-weight="bold">${svgTexto(nome)} ganhou</text><text x="400" y="635" text-anchor="middle" fill="#fff" font-size="25">+${premio} WACoins</text></svg>`;
-    return sharp(Buffer.from(svg)).png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer();
+    return sharp(Buffer.from(aplicarMolduraNatalSVG(svg))).png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer();
 }
 
 async function executarRoletaGratuita(sock, jid, id, nome) {
@@ -2766,17 +3253,110 @@ async function executarRoletaGratuita(sock, jid, id, nome) {
     await enviar(sock,jid,{image:imagem,caption:`🎡 *RODA DA SORTE*\n\nVocê recebeu *${formatarWACoins(premio)}*!\nGiro diário gratuito. Não há custo nem possibilidade de perder moedas.`});
 }
 
-async function renascerPesca(sock, jid, id, nome) {
-    const p = obterDadosPescador(id,nome);
-    const requisito = 500;
-    if ((p.renascimentos || 0) >= 20) { await texto(sock,jid,'🏆 Você atingiu o limite de 20 renascimentos da pesca e já possui todos os bônus permanentes.'); return; }
-    if (p.capturas < requisito) { await texto(sock,jid,`🌊 *RENASCIMENTO DA PESCA*\n\nRequisito: ${requisito} capturas.\nSeu progresso: ${p.capturas}/${requisito}.\n\nAo renascer, coleção, capturas e equipamentos serão reiniciados; seus WACoins não serão alterados. Você mantém os bônus de renascimento.`); return; }
-    const confirmacao = (p.renascimentos || 0) + 1;
-    const novo = { nome:p.nome, moedas:0, capturas:0, maiorPeixe:0, peixes:[], itensEvento:[], bonusSorteEvento:0, renascimentos:confirmacao, bonusSorteRenascimento:Math.min(20,(p.bonusSorteRenascimento||0)+1), bonusPesoRenascimento:Math.min(1,(p.bonusPesoRenascimento||0)+0.05), equipamentos:{vara:'basica',isca:'comum',linha:0,amuleto:0,anel:0,relicario:0,pingente:0,acelerador:0,peso:0} };
+async function renascerPesca(sock, jid, id, nome, acao = '') {
+    const p = obterDadosPescador(id, nome);
+    const requisitos = obterRequisitosRenascimentoPesca(p);
+    const chaveCarteira = obterChaveCarteiraUsuario(id);
+    const carteira = obterCarteira(id, nome);
+    const dinheiroAtual = Math.floor((Number(carteira.saldo) || 0) + (Number(carteira.banco) || 0));
+    const peixesAtuais = Array.isArray(p.peixes) ? p.peixes.length : 0;
+    const comando = normalizar(acao || '');
+
+    if ((p.renascimentos || 0) >= 20) {
+        return texto(sock, jid, '🏆 Você atingiu o limite de 20 renascimentos da pesca e já possui todos os bônus permanentes.');
+    }
+    if (comando === 'cancelar') {
+        pendingRenascimentosPesca.delete(id);
+        return texto(sock, jid, '❎ Renascimento cancelado. Seus dados e WACoins continuam intactos.');
+    }
+    if (comando !== 'confirmar') {
+        const faltas = [];
+        if (p.capturas < requisitos.capturas) faltas.push(`• Capturas: ${p.capturas}/${requisitos.capturas}`);
+        if (peixesAtuais < requisitos.peixes) faltas.push(`• Peixes no inventário: ${peixesAtuais}/${requisitos.peixes}`);
+        if (dinheiroAtual < requisitos.dinheiro) faltas.push(`• WACoins (saldo + banco): ${formatarWACoins(dinheiroAtual)} / ${formatarWACoins(requisitos.dinheiro)}`);
+        const status = faltas.length ? `\n\n❌ *Ainda faltam requisitos:*\n${faltas.join('\n')}` : '\n\n✅ *Todos os requisitos foram alcançados!*';
+        const textoRequisitos = `🌟 *RENASCIMENTO ${requisitos.numero}*\n\n🎣 Capturas necessárias: *${requisitos.capturas}*\n🐟 Peixes que precisam estar no inventário: *${requisitos.peixes}*\n💰 WACoins mínimos (saldo + banco): *${formatarWACoins(requisitos.dinheiro)}*\n\nAo confirmar, você perderá TODOS os seus WACoins (saldo e banco), peixes, capturas, equipamentos, itens de evento e voltará para a Costa Inicial.\n\nVocê manterá seus renascimentos anteriores e receberá bônus permanentes de sorte e peso.${status}`;
+        if (faltas.length) return texto(sock, jid, textoRequisitos + '\n\nQuando cumprir tudo, envie *!renascerpesca confirmar*.');
+        pendingRenascimentosPesca.set(id, { criadoEm: Date.now(), numero: requisitos.numero });
+        return texto(sock, jid, textoRequisitos + '\n\n⚠️ Para executar, envie *!renascerpesca confirmar* em até 2 minutos. Para desistir: *!renascerpesca cancelar*.');
+    }
+
+    const pendente = pendingRenascimentosPesca.get(id);
+    if (!pendente || Date.now() - pendente.criadoEm > 2 * 60 * 1000 || pendente.numero !== requisitos.numero) {
+        pendingRenascimentosPesca.delete(id);
+        return texto(sock, jid, '⌛ Não há confirmação válida de renascimento. Envie !renascerpesca para conferir os requisitos novamente.');
+    }
+    if (p.capturas < requisitos.capturas || peixesAtuais < requisitos.peixes || dinheiroAtual < requisitos.dinheiro) {
+        pendingRenascimentosPesca.delete(id);
+        return texto(sock, jid, '❌ Seus requisitos mudaram e não são mais suficientes. Envie !renascerpesca para conferir novamente.');
+    }
+
+    pendingRenascimentosPesca.delete(id);
+    const confirmacao = requisitos.numero;
+    const novo = {
+        nome: p.nome,
+        moedas: 0,
+        capturas: 0,
+        maiorPeixe: 0,
+        marPesca: 'costa',
+        peixes: [],
+        itensEvento: [],
+        bonusSorteEvento: 0,
+        renascimentos: confirmacao,
+        bonusSorteRenascimento: Math.min(20, (p.bonusSorteRenascimento || 0) + 1),
+        bonusPesoRenascimento: Math.min(1, (p.bonusPesoRenascimento || 0) + 0.05),
+        equipamentos: { vara: 'basica', isca: 'comum', linha: 0, amuleto: 0, anel: 0, relicario: 0, pingente: 0, acelerador: 0, peso: 0 }
+    };
     dadosPesca[id] = novo;
+    // WACoins são a moeda compartilhada do bot; o renascimento zera saldo e banco.
+    const carteiraReal = carteirasWACoins[chaveCarteira] || carteira;
+    carteiraReal.saldo = 0;
+    carteiraReal.banco = 0;
+    carteiraReal.ultimaAtualizacaoBanco = Date.now();
     cooldownPesca.delete(id);
-    await salvarDadosPesca();
-    await texto(sock,jid,`🌟 *RENASCIMENTO ${confirmacao} CONCLUÍDO!*\n\nSua pesca voltou ao início.\n🍀 Bônus permanente de sorte: +${novo.bonusSorteRenascimento}\n⚖️ Bônus permanente de peso: +${Math.round(novo.bonusPesoRenascimento*100)}%\n\nSeus WACoins foram preservados. Próximo renascimento: mais ${requisito} capturas.`);
+    await Promise.all([salvarDadosPesca(), salvarWACoins()]);
+    return texto(sock, jid, `🌟 *RENASCIMENTO ${confirmacao} CONCLUÍDO!*\n\nVocê voltou para a *Costa Inicial*.\n🪙 WACoins zerados: saldo e banco.\n🐟 Coleção, capturas e equipamentos reiniciados.\n🍀 Bônus permanente de sorte: +${novo.bonusSorteRenascimento}\n⚖️ Bônus permanente de peso: +${Math.round(novo.bonusPesoRenascimento * 100)}%\n\nUse !mares para ver os mares. Próximo renascimento: ${obterRequisitosRenascimentoPesca(novo).capturas} capturas, ${obterRequisitosRenascimentoPesca(novo).peixes} peixes e ${formatarWACoins(obterRequisitosRenascimentoPesca(novo).dinheiro)}.`);
+}
+
+async function verificarResetTemporadaPesca(notificar = false, sock = null) {
+    const mesAtual = dataLocalISO().slice(0, 7);
+    sistemasV310.temporadaPesca ||= {};
+    const estado = sistemasV310.temporadaPesca;
+    if (!estado.mesAtual) {
+        estado.mesAtual = mesAtual;
+        estado.numeroTemporada = Math.max(1, Number(estado.numeroTemporada) || 1);
+        estado.iniciadoEm = Date.now();
+        await salvarSistemas310();
+        return false;
+    }
+    if (estado.mesAtual === mesAtual) return false;
+
+    const agora = Date.now();
+    const sufixo = new Date(agora).toISOString().replace(/[:.]/g, '-');
+    await writeFile(path.join(DIRETORIO, `backup-temporada-pesca-${sufixo}.json`), JSON.stringify(dadosPesca, null, 2), 'utf8');
+    for (const [id, antigo] of Object.entries(dadosPesca)) {
+        const nome = antigo?.nome || nomeExibicao(id);
+        dadosPesca[id] = {
+            nome, moedas:0, capturas:0, maiorPeixe:0, marPesca:'costa', peixes:[], itensEvento:[], bonusSorteEvento:0,
+            renascimentos:Number(antigo?.renascimentos)||0,
+            bonusSorteRenascimento:Number(antigo?.bonusSorteRenascimento)||0,
+            bonusPesoRenascimento:Number(antigo?.bonusPesoRenascimento)||0,
+            equipamentos:{vara:'basica',isca:'comum',linha:0,amuleto:0,anel:0,relicario:0,pingente:0,acelerador:0,peso:0}
+        };
+    }
+    cooldownPesca.clear(); pescariasEmAndamento.clear();
+    for (const trip of Object.values(sistemasV310.tripulacoes || {})) { trip.pontos = 0; trip.capturas = 0; trip.resetTemporadaEm = agora; }
+    estado.mesAnterior = estado.mesAtual;
+    estado.mesAtual = mesAtual;
+    estado.numeroTemporada = (Number(estado.numeroTemporada)||1) + 1;
+    estado.iniciadoEm = agora;
+    estado.ultimoResetEm = agora;
+    estado.historico ||= [];
+    estado.historico.push({ mes:mesAtual, data: new Date(agora).toISOString(), jogadores:Object.keys(dadosPesca).length });
+    estado.historico = estado.historico.slice(-24);
+    await Promise.all([salvarDadosPesca(), salvarSistemas310()]);
+    if (notificar && sock) console.log(`[PESCA] Temporada ${estado.numeroTemporada} iniciada: ${mesAtual}. Backup da temporada anterior criado.`);
+    return true;
 }
 
 function parseDuracaoReset(valor) {
@@ -2842,9 +3422,14 @@ async function processarAgendamentoReset(sock, jid, msg, args) {
 
 function iniciarAgendadorResets(sock) {
     if (timerResetAgendado) clearInterval(timerResetAgendado);
+    let ultimaChecagemTemporada = 0;
     timerResetAgendado = setInterval(async () => {
         try {
             const agora = Date.now();
+            if (agora - ultimaChecagemTemporada >= 60 * 60 * 1000) {
+                ultimaChecagemTemporada = agora;
+                await verificarResetTemporadaPesca(true, sock);
+            }
             for (const [tipo, agenda] of Object.entries(sistemasV310.resetAgendado || {})) {
                 if (!agenda?.proximoReset || agora < agenda.proximoReset) continue;
                 await resetarSistema(tipo);
@@ -2856,11 +3441,899 @@ function iniciarAgendadorResets(sock) {
     },15000);
 }
 
-async function processarRPG(id, nome, args) {
+// ==================================================
+// POLÍTICA POR GRUPO: PARTIDOS, ELEIÇÕES E MANDATOS
+// ==================================================
+
+function migrarPoliticaParaGlobal() {
+    sistemasV310.politica ||= { grupos: {} };
+    const politica = sistemasV310.politica;
+    politica.grupos ||= {};
+    let mudou = false;
+
+    if (!politica.global || typeof politica.global !== 'object') {
+        politica.global = { partidos: {}, membros: {}, eleicao: null, mandato: null, propostas: [], historico: [], mandatosPorUsuario: {} };
+        mudou = true;
+    }
+
+    const global = politica.global;
+    global.partidos ||= {};
+    global.membros ||= {};
+    global.propostas ||= [];
+    global.historico ||= [];
+    global.mandatosPorUsuario ||= {};
+
+    // Migra os registros antigos por grupo para o registro global.
+    // Se havia mais de uma eleição antiga aberta, mantém a mais recente;
+    // eleições com o mesmo ID têm candidatos e votos consolidados.
+    const grupos = Object.values(politica.grupos);
+    const eleicoes = grupos.map(g => g?.eleicao).filter(Boolean);
+    const abertas = eleicoes.filter(e => e.status === 'aberta').sort((a,b) => Number(b.criadaEm || 0) - Number(a.criadaEm || 0));
+
+    if (!global.eleicao && abertas.length) {
+        global.eleicao = JSON.parse(JSON.stringify(abertas[0]));
+        mudou = true;
+    }
+
+    if (global.eleicao?.status === 'aberta') {
+        for (const antiga of abertas) {
+            if (!antiga || antiga.id !== global.eleicao.id) continue;
+            for (const cargo of ['prefeito','vice','vereador']) {
+                global.eleicao.candidatos ||= {};
+                const atuais = global.eleicao.candidatos[cargo] ||= [];
+                for (const candidato of antiga.candidatos?.[cargo] || []) {
+                    if (!atuais.some(x => mesmoUsuario(x.id, candidato.id))) atuais.push(candidato);
+                }
+                global.eleicao.votos ||= { prefeito:{}, vice:{}, vereador:{} };
+                global.eleicao.votos[cargo] ||= {};
+                Object.assign(global.eleicao.votos[cargo], antiga.votos?.[cargo] || {});
+            }
+            mudou = true;
+        }
+    }
+
+    if (!global.mandato) {
+        const mandatos = grupos.map(g => g?.mandato).filter(m => m && Number(m.terminaEm || 0) > Date.now()).sort((a,b) => Number(b.iniciadoEm || 0) - Number(a.iniciadoEm || 0));
+        if (mandatos.length) { global.mandato = JSON.parse(JSON.stringify(mandatos[0])); mudou = true; }
+    }
+
+    for (const antigo of grupos) {
+        if (!antigo || typeof antigo !== 'object') continue;
+        for (const [id, partido] of Object.entries(antigo.partidos || {})) {
+            if (!global.partidos[id]) { global.partidos[id] = partido; mudou = true; }
+            else {
+                global.partidos[id].membros ||= [];
+                for (const membro of partido?.membros || []) if (!global.partidos[id].membros.some(x => mesmoUsuario(x,membro))) global.partidos[id].membros.push(membro);
+            }
+        }
+        for (const [membro, partidoId] of Object.entries(antigo.membros || {})) {
+            if (!global.membros[membro]) { global.membros[membro] = partidoId; mudou = true; }
+        }
+        for (const proposta of antigo.propostas || []) {
+            if (!global.propostas.some(x => String(x.id) === String(proposta.id))) { global.propostas.push(proposta); mudou = true; }
+        }
+        for (const item of antigo.historico || []) {
+            if (!global.historico.some(x => x.eleicaoId && x.eleicaoId === item.eleicaoId && x.iniciadoEm === item.iniciadoEm)) { global.historico.push(item); mudou = true; }
+        }
+    }
+
+    if (Object.keys(global.mandatosPorUsuario).length === 0) {
+        const registros = [...(global.historico || []), global.mandato, ...grupos.flatMap(x => [x?.mandato, ...(x?.historico || [])])].filter(Boolean);
+        const vistosMandatos = new Set();
+        for (const mandatoAntigo of registros) {
+            const chaveMandato = String(mandatoAntigo.eleicaoId || mandatoAntigo.iniciadoEm || `${mandatoAntigo.prefeito?.id || ''}-${mandatoAntigo.terminaEm || ''}`);
+            if (vistosMandatos.has(chaveMandato)) continue;
+            vistosMandatos.add(chaveMandato);
+            const eleitosAntigos = [mandatoAntigo.prefeito, mandatoAntigo.vice, ...(mandatoAntigo.vereadores || [])].filter(x => x?.id);
+            for (const eleito of eleitosAntigos) {
+                const chave = encontrarChaveUsuario(global.mandatosPorUsuario, eleito.id) || eleito.id;
+                global.mandatosPorUsuario[chave] = (Number(global.mandatosPorUsuario[chave]) || 0) + 1;
+                mudou = true;
+            }
+        }
+    }
+
+    return mudou;
+}
+
+function obterPoliticaGrupo(grupoJid) {
+    // Compatibilidade com as chamadas antigas: todos os grupos apontam
+    // para o MESMO objeto político persistido em dados-sistemas-v310.json.
+    sistemasV310.politica ||= { grupos: {} };
+    sistemasV310.politica.grupos ||= {};
+    const p = sistemasV310.politica;
+    p.global ||= { partidos: {}, membros: {}, eleicao: null, mandato: null, propostas: [], historico: [] };
+    const g = p.global;
+    g.partidos ||= {}; g.membros ||= {}; g.propostas ||= []; g.historico ||= []; g.mandatosPorUsuario ||= {};
+    return g;
+}
+
+function cargoPoliticoDoUsuario(grupoJid, usuarioId) {
+    if (!grupoJid?.endsWith('@g.us')) return null;
+    const g = obterPoliticaGrupo(grupoJid);
+    const m = g.mandato;
+    if (!m || Date.now() >= Number(m.terminaEm || 0)) {
+        if (m) { g.historico.push({ ...m, encerradoEm: Date.now() }); g.mandato = null; }
+        return null;
+    }
+    if (m.prefeito && mesmoUsuario(m.prefeito.id, usuarioId)) return 'prefeito';
+    if (m.vice && mesmoUsuario(m.vice.id, usuarioId)) return 'vice';
+    if ((m.vereadores || []).some(x => mesmoUsuario(x.id, usuarioId))) return 'vereador';
+    return null;
+}
+
+function obterContagemMandatosPoliticos(g, usuarioId) {
+    const mapa = g.mandatosPorUsuario ||= {};
+    const chave = encontrarChaveUsuario(mapa, usuarioId);
+    return Math.max(0, Number(chave ? mapa[chave] : 0) || 0);
+}
+
+function contarVotosEleicao(eleicao, cargo, candidatoId) {
+    return Object.values(eleicao.votos?.[cargo] || {}).filter(id => mesmoUsuario(id, candidatoId)).length;
+}
+
+async function gerarImagemRankingPolitico(grupoJid) {
+    const g = obterPoliticaGrupo(grupoJid);
+    const e = g.eleicao;
+    const cargos = [
+        ['prefeito', 'PREFEITO'],
+        ['vice', 'VICE-PREFEITO'],
+        ['vereador', 'VEREADORES']
+    ];
+    const linhas = [];
+    let y = 300;
+
+    if (e) {
+        for (const [chave, titulo] of cargos) {
+            const lista = [...(e.candidatos?.[chave] || [])]
+                .map(c => ({ ...c, votos: contarVotosEleicao(e, chave, c.id) }))
+                .sort((a, b) => b.votos - a.votos || Number(a.inscritoEm || 0) - Number(b.inscritoEm || 0));
+            linhas.push(`<text x="92" y="${y}" font-family="DejaVu Sans, Noto Sans, sans-serif" font-size="21" font-weight="bold" fill="#70E5D6">${titulo}</text>`);
+            y += 24;
+            if (!lista.length) {
+                linhas.push(`<text x="105" y="${y+23}" font-family="DejaVu Sans, Noto Sans, sans-serif" font-size="18" fill="#A9C6D8">Nenhum candidato inscrito</text>`);
+                y += 55;
+                continue;
+            }
+            for (const [i, c] of lista.slice(0, 5).entries()) {
+                const nome = escaparSVG(String(c.nome || 'Participante').slice(0, 28));
+                const partido = escaparSVG(String(c.partido || 'Independente').slice(0, 24));
+                linhas.push(`<rect x="82" y="${y}" width="860" height="48" rx="12" fill="#152B50" stroke="#2C5278"/>`);
+                linhas.push(`<text x="105" y="${y+31}" font-family="DejaVu Sans, Noto Sans, sans-serif" font-size="18" font-weight="bold" fill="#F4F8FF">${i+1}. ${nome}</text>`);
+                linhas.push(`<text x="620" y="${y+30}" text-anchor="end" font-family="DejaVu Sans, Noto Sans, sans-serif" font-size="14" fill="#A9C6D8">${partido}</text>`);
+                linhas.push(`<text x="910" y="${y+30}" text-anchor="end" font-family="DejaVu Sans, Noto Sans, sans-serif" font-size="17" font-weight="bold" fill="#72E4D1">${c.votos} voto(s)</text>`);
+                y += 56;
+            }
+            y += 10;
+        }
+    } else {
+        linhas.push(`<text x="512" y="360" text-anchor="middle" font-family="DejaVu Sans, Noto Sans, sans-serif" font-size="24" fill="#FFFFFF">Nenhuma eleição registrada neste grupo</text>`);
+        y = 430;
+    }
+
+    const altura = Math.max(520, y + 85);
+    const status = e ? `ELEIÇÃO ${e.id} • ${String(e.status || 'sem status').toUpperCase()}` : 'SEM ELEIÇÃO REGISTRADA';
+    const svg = `<svg width="1024" height="${altura}" xmlns="http://www.w3.org/2000/svg">
+      <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#071629"/><stop offset="100%" stop-color="#103D5B"/></linearGradient></defs>
+      <rect width="1024" height="${altura}" fill="url(#bg)"/>
+      <rect x="48" y="38" width="928" height="${altura-76}" rx="30" fill="#0A2039" stroke="#2A6680" stroke-width="2"/>
+      <text x="92" y="105" font-family="DejaVu Sans, Noto Sans, sans-serif" font-size="20" font-weight="bold" letter-spacing="4" fill="#70E5D6">WABOT • POLÍTICA</text>
+      <text x="92" y="165" font-family="DejaVu Sans, Noto Sans, sans-serif" font-size="42" font-weight="bold" fill="#FFFFFF">RANKING ELEITORAL</text>
+      <text x="92" y="207" font-family="DejaVu Sans, Noto Sans, sans-serif" font-size="18" fill="#A9C6D8">${escaparSVG(status)} • VOTOS REAIS</text>
+      ${linhas.join('\n')}
+      <text x="512" y="${altura-52}" text-anchor="middle" font-family="DejaVu Sans, Noto Sans, sans-serif" font-size="14" letter-spacing="2" fill="#78A9C0">RESULTADOS ATUALIZADOS NO MOMENTO DA SOLICITAÇÃO</text>
+    </svg>`;
+    return sharp(Buffer.from(aplicarMolduraNatalSVG(svg))).png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer();
+}
+
+async function finalizarEleicaoPolitica(grupoJid, forcar = false) {
+    const g = obterPoliticaGrupo(grupoJid);
+    const e = g.eleicao;
+    if (!e || e.status !== 'aberta') return 'Não existe eleição aberta neste grupo.';
+    if (!forcar && Date.now() < e.terminaEm) return 'A votação ainda está aberta.';
+    const totalCandidatos=(e.candidatos.prefeito||[]).length+(e.candidatos.vice||[]).length+(e.candidatos.vereador||[]).length;
+    if(!totalCandidatos) { e.status='encerrada'; e.encerradaEm=Date.now(); e.resultado=null; await salvarSistemas310(); return `🗳️ Eleição ${e.id} encerrada sem candidatos. Nenhum mandato foi iniciado. O administrador pode abrir outra eleição.`; }
+    const limiteMandatos = 2;
+    const elegiveis = cargo => (e.candidatos[cargo] || []).filter(c => obterContagemMandatosPoliticos(g, c.id) < limiteMandatos);
+    const ordenar = cargo => elegiveis(cargo).sort((a,b) => contarVotosEleicao(e,cargo,b.id)-contarVotosEleicao(e,cargo,a.id) || a.inscritoEm-b.inscritoEm);
+    const vencedor = cargo => ordenar(cargo)[0] || null;
+    const vereadores = ordenar('vereador').slice(0,3);
+    const agora = Date.now();
+    const mandato = { prefeito: vencedor('prefeito'), vice: vencedor('vice'), vereadores, iniciadoEm: agora, terminaEm: agora + 7*24*60*60*1000, eleicaoId: e.id };
+    const eleitos = [mandato.prefeito, mandato.vice, ...mandato.vereadores].filter(Boolean).filter((c,i,lista)=>lista.findIndex(x=>mesmoUsuario(x.id,c.id))===i);
+    g.mandatosPorUsuario ||= {};
+    for (const eleito of eleitos) {
+        const chave = encontrarChaveUsuario(g.mandatosPorUsuario, eleito.id) || eleito.id;
+        g.mandatosPorUsuario[chave] = (Number(g.mandatosPorUsuario[chave]) || 0) + 1;
+    }
+    e.mandatosContabilizados = true;
+    e.status = 'encerrada'; e.encerradaEm = agora; e.resultado = mandato;
+    g.mandato = mandato;
+    await salvarSistemas310();
+    const bloqueados = Object.values(e.candidatos || {}).flat().filter(c => obterContagemMandatosPoliticos(g,c.id) >= limiteMandatos).length;
+    const nome = x => x ? `${x.nome}${x.partido ? ` (${x.partido})` : ''}` : 'Ninguém eleito';
+    return `🏛️ *RESULTADO DA ELEIÇÃO ${e.id}*\n\n👑 Prefeito: *${nome(mandato.prefeito)}*\n🤝 Vice-prefeito: *${nome(mandato.vice)}*\n🏛️ Vereadores:\n${vereadores.length ? vereadores.map((x,i)=>`${i+1}. ${nome(x)} — ${contarVotosEleicao(e,'vereador',x.id)} voto(s)`).join('\n') : 'Nenhum eleito'}\n\n📅 Mandato de 7 dias, até ${new Date(mandato.terminaEm).toLocaleString('pt-BR',{timeZone:'America/Sao_Paulo'})}.\n🚫 Candidatos que atingiram o limite de mandatos: ${bloqueados}.`;
+}
+
+async function processarEleicao(sock, grupoJid, usuarioId, nome, args, msg) {
+    if (!grupoJid?.endsWith('@g.us')) return '🏛️ O sistema político funciona dentro de grupos do WhatsApp.';
+    const g = obterPoliticaGrupo(grupoJid);
+    const acao = normalizar(args[0] || 'status');
+    if (g.eleicao?.status === 'aberta' && Date.now() >= g.eleicao.terminaEm) {
+        await finalizarEleicaoPolitica(grupoJid);
+    }
+    if (acao === 'criar') {
+        if (!await remetenteEhAdminBot(sock,msg)) return '⛔ Somente o administrador registrado no código pode criar eleições.';
+        if (g.eleicao?.status === 'aberta') return 'Já existe uma eleição aberta neste grupo.';
+        if (g.mandato && Date.now() < g.mandato.terminaEm) return `O mandato atual termina em ${new Date(g.mandato.terminaEm).toLocaleString('pt-BR',{timeZone:'America/Sao_Paulo'})}.`;
+        const horas = Math.max(1,Math.min(72,Number(args[1])||24));
+        const id = `E${Date.now().toString(36).toUpperCase()}`;
+        g.eleicao = { id, status:'aberta', criadaEm:Date.now(), terminaEm:Date.now()+horas*3600000, candidatos:{prefeito:[],vice:[],vereador:[]}, votos:{prefeito:{},vice:{},vereador:{}} };
+        await salvarSistemas310();
+        return `🗳️ *ELEIÇÃO ${id} ABERTA!*\n\nInscrições e votação ficam abertas por ${horas} hora(s). Os eleitos terão mandato de 7 dias.\n\nCandidatar-se: !eleicao candidatar prefeito | vice | vereador\nVotar: !votar prefeito @pessoa\nPartidos: !partido criar NOME`;
+    }
+    if (acao === 'candidatos') {
+        const e=g.eleicao;
+        if(!e) return 'Nenhuma eleição registrada.';
+        return `🗳️ *CANDIDATOS DA ELEIÇÃO ${e.id}*\n\n${['prefeito','vice','vereador'].map(c=>`*${c.toUpperCase()}*\n${e.candidatos[c].length?e.candidatos[c].map(x=>`• ${x.nome} — ${x.partido||'Independente'}`).join('\n'):'Nenhum candidato'}`).join('\n\n')}`;
+    }
+    if (acao === 'status') {
+        const e = g.eleicao;
+        const m = g.mandato && Date.now() < g.mandato.terminaEm ? g.mandato : null;
+        if (e?.status === 'aberta' && Date.now() >= e.terminaEm) return await finalizarEleicaoPolitica(grupoJid);
+        const linhas = e ? `Eleição: ${e.id} (${e.status})\nCandidatos: prefeito ${e.candidatos.prefeito.length}, vice ${e.candidatos.vice.length}, vereador ${e.candidatos.vereador.length}\n${e.status==='aberta' ? `Encerra: ${new Date(e.terminaEm).toLocaleString('pt-BR',{timeZone:'America/Sao_Paulo'})}` : ''}` : 'Nenhuma eleição registrada.';
+        const cargo = m ? `\n\n👑 Prefeito: ${m.prefeito?.nome||'—'}\n🤝 Vice: ${m.vice?.nome||'—'}\n🏛️ Vereadores: ${(m.vereadores||[]).map(x=>x.nome).join(', ')||'—'}\nMandato até: ${new Date(m.terminaEm).toLocaleString('pt-BR',{timeZone:'America/Sao_Paulo'})}` : '\n\nNenhum mandato ativo.';
+        return `🏛️ *POLÍTICA DO GRUPO*\n\n${linhas}${cargo}`;
+    }
+    if (acao === 'candidatar') {
+        const e = g.eleicao;
+        if (!e || e.status !== 'aberta' || Date.now() >= e.terminaEm) return 'Não há inscrições abertas. Consulte !eleicao status.';
+        const cargo = normalizar(args[1]||'');
+        if (!['prefeito','vice','vereador'].includes(cargo)) return 'Cargo inválido. Use prefeito, vice ou vereador.';
+        const lista = e.candidatos[cargo];
+        if (obterContagemMandatosPoliticos(g, usuarioId) >= 2) return '🚫 Você já completou o limite de 2 mandatos eleitos. Não pode concorrer novamente.';
+        if (Object.values(e.candidatos).flat().some(x=>mesmoUsuario(x.id,usuarioId))) return 'Você já está inscrito para um cargo nesta eleição. Cada pessoa pode concorrer a apenas um cargo por eleição.';
+        if (lista.length >= 30) return 'Limite de 30 candidatos para esse cargo atingido.';
+        const partidoId = g.membros[usuarioId];
+        const partido = partidoId ? g.partidos[partidoId]?.nome : '';
+        lista.push({ id:usuarioId, nome:nomeExibicao(usuarioId,nome), partido:partido||'', inscritoEm:Date.now() });
+        await salvarSistemas310();
+        return `✅ Candidatura registrada!\nCargo: ${cargo}\nNome: ${nomeExibicao(usuarioId,nome)}\nPartido: ${partido||'Independente'}.`;
+    }
+    if (acao === 'encerrar') {
+        if (!await remetenteEhAdminBot(sock,msg)) return '⛔ Somente o administrador registrado no código pode encerrar a eleição.';
+        return await finalizarEleicaoPolitica(grupoJid,true);
+    }
+    if (acao === 'cancelar') {
+        if (!await remetenteEhAdminBot(sock,msg)) return '⛔ Somente o administrador registrado no código pode cancelar a eleição.';
+        if (!g.eleicao || g.eleicao.status !== 'aberta') return 'Não existe eleição aberta.';
+        g.eleicao.status='cancelada'; g.eleicao.canceladaEm=Date.now(); await salvarSistemas310();
+        return '🛑 Eleição cancelada pelo administrador. Nenhum cargo foi alterado.';
+    }
+    return 'Use !eleicao criar [horas], !eleicao status, !eleicao candidatar prefeito/vice/vereador, !eleicao encerrar ou !eleicao cancelar.';
+}
+
+async function processarPartido(grupoJid, usuarioId, nome, args, msg) {
+    if (!grupoJid?.endsWith('@g.us')) return 'Partidos só podem ser gerenciados dentro de grupos.';
+    const g = obterPoliticaGrupo(grupoJid);
+    const acao = normalizar(args[0]||'info');
+    const nomePartido = args.slice(1).join(' ').trim();
+    const chave = normalizar(nomePartido).replace(/[^a-z0-9]+/g,'_').replace(/^_|_$/g,'').slice(0,24);
+    if (acao === 'criar') {
+        if (!nomePartido || nomePartido.length < 3 || nomePartido.length > 32) return 'Nome do partido deve ter entre 3 e 32 caracteres. Ex.: !partido criar Renovação.';
+        if (g.membros[usuarioId]) return 'Você já pertence a um partido. Use !partido sair antes.';
+        if (g.partidos[chave]) return 'Já existe um partido com esse nome neste grupo.';
+        g.partidos[chave] = { id:chave, nome:nomePartido, lider:usuarioId, membros:[usuarioId], criadoEm:Date.now() };
+        g.membros[usuarioId]=chave; await salvarSistemas310();
+        return `🏴 *PARTIDO CRIADO*\n${nomePartido}\nVocê é o fundador e líder. Outros podem usar !partido entrar ${nomePartido}.`;
+    }
+    if (acao === 'entrar') {
+        if (!nomePartido) return 'Informe o nome: !partido entrar NOME.';
+        if (g.membros[usuarioId]) return 'Você já pertence a um partido. Saia primeiro com !partido sair.';
+        const partido=g.partidos[chave]; if(!partido) return 'Partido não encontrado neste grupo.';
+        partido.membros ||= []; partido.membros.push(usuarioId); g.membros[usuarioId]=chave; await salvarSistemas310();
+        return `Você entrou no partido *${partido.nome}*.`;
+    }
+    if (acao === 'lider') {
+        const atual=g.membros[usuarioId]; const partido=atual?g.partidos[atual]:null;
+        if(!partido || !mesmoUsuario(partido.lider,usuarioId)) return 'Somente o líder atual pode transferir a liderança.';
+        const alvo=obterMencoes(msg)[0];
+        if(!alvo || !partido.membros.some(x=>mesmoUsuario(x,alvo))) return 'Mencione alguém que já pertença ao seu partido: !partido lider @pessoa.';
+        partido.lider=alvo; await salvarSistemas310();
+        return `👑 Liderança do partido *${partido.nome}* transferida para ${nomeExibicao(alvo)}.`;
+    }
+    if (acao === 'sair') {
+        const atual=g.membros[usuarioId]; if(!atual) return 'Você não está em nenhum partido.';
+        const partido=g.partidos[atual]; if(partido?.lider===usuarioId && partido.membros.length>1) return 'Como líder, transfira a liderança antes de sair. (Recurso de transferência disponível ao administrador do grupo.)';
+        if(partido) { partido.membros=partido.membros.filter(x=>!mesmoUsuario(x,usuarioId)); if(partido.lider===usuarioId && partido.membros.length===0) delete g.partidos[atual]; }
+        delete g.membros[usuarioId]; await salvarSistemas310(); return 'Você saiu do partido.';
+    }
+    if (acao === 'listar') {
+        const lista=Object.values(g.partidos); return lista.length ? `🏴 *PARTIDOS DO GRUPO*\n\n${lista.map(x=>`• *${x.nome}* — ${x.membros.length} membro(s)`).join('\n')}` : 'Ainda não existem partidos neste grupo.';
+    }
+    const id=g.membros[usuarioId]; const partido=id?g.partidos[id]:null;
+    return partido ? `🏴 *${partido.nome}*\nLíder: ${nomeExibicao(partido.lider)}\nMembros: ${partido.membros.length}` : 'Você não está em um partido. Use !partido listar ou !partido criar NOME.';
+}
+
+async function processarVotoPolitico(grupoJid, usuarioId, args, msg) {
+    if (!grupoJid?.endsWith('@g.us')) return 'A votação política só funciona em grupos.';
+    const g=obterPoliticaGrupo(grupoJid), e=g.eleicao;
+    if(!e || e.status!=='aberta') return 'Não há votação aberta. Use !eleicao status.';
+    if(Date.now()>=e.terminaEm) return await finalizarEleicaoPolitica(grupoJid);
+    const cargo=normalizar(args[0]||'');
+    if(!['prefeito','vice','vereador'].includes(cargo)) return 'Escolha: !votar prefeito @pessoa, !votar vice @pessoa ou !votar vereador @pessoa.';
+    const alvo=obterMencoes(msg)[0]; if(!alvo) return 'Mencione o candidato que receberá seu voto.';
+    const candidato=e.candidatos[cargo].find(x=>mesmoUsuario(x.id,alvo)); if(!candidato) return 'Essa pessoa não está inscrita como candidata a esse cargo.';
+    e.votos[cargo][usuarioId]=candidato.id; await salvarSistemas310();
+    return `🗳️ Voto registrado para *${candidato.nome}* (${cargo}). Você pode alterar seu voto enquanto a eleição estiver aberta.`;
+}
+
+async function processarPropostaPolitica(grupoJid, usuarioId, nome, args) {
+    if(!grupoJid?.endsWith('@g.us')) return 'Use este comando em um grupo.';
+    const g=obterPoliticaGrupo(grupoJid), acao=normalizar(args[0]||'');
+    const cargo=cargoPoliticoDoUsuario(grupoJid,usuarioId);
+    if(acao==='listar') return g.propostas.length ? `📜 *PROPOSTAS*\n\n${g.propostas.slice(-10).map(p=>`#${p.id} ${p.texto}\n👍 ${Object.values(p.votos).filter(v=>v==='sim').length} | 👎 ${Object.values(p.votos).filter(v=>v==='nao').length}`).join('\n\n')}` : 'Nenhuma proposta registrada.';
+    if(acao==='votar') {
+        const p=g.propostas.find(x=>x.id===String(args[1]||'')); const voto=normalizar(args[2]||'');
+        if(!p) return 'Proposta não encontrada. Use !proposta listar.';
+        if(Date.now()>p.terminaEm) return 'A votação dessa proposta terminou.';
+        if(!['sim','nao'].includes(voto)) return 'Use !proposta votar ID sim ou !proposta votar ID nao.';
+        p.votos[usuarioId]=voto; await salvarSistemas310(); return `Voto ${voto.toUpperCase()} registrado na proposta #${p.id}.`;
+    }
+    if(cargo!=='vereador') return 'Somente um vereador pode apresentar uma proposta oficial.';
+    if(g.propostas.some(p=>mesmoUsuario(p.autor,usuarioId) && Date.now()<p.terminaEm)) return 'Você já possui uma proposta em votação. Aguarde o encerramento antes de publicar outra.';
+    const textoProposta=args.join(' ').trim();
+    if(textoProposta.length<8 || textoProposta.length>300) return 'Escreva uma proposta de 8 a 300 caracteres: !proposta texto da proposta.';
+    const id=String(Date.now()).slice(-6);
+    g.propostas.push({id,autor:usuarioId,nome:nomeExibicao(usuarioId,nome),texto:textoProposta,criadaEm:Date.now(),terminaEm:Date.now()+24*3600000,votos:{}});
+    await salvarSistemas310();
+    return `📜 *PROPOSTA #${id} PUBLICADA*\n${textoProposta}\n\nO grupo pode votar por 24 horas:\n!proposta votar ${id} sim\n!proposta votar ${id} nao`;
+}
+
+async function processarPoderPolitico(sock, grupoJid, usuarioId, nome, args, msg) {
+    if(!grupoJid?.endsWith('@g.us')) return 'Poderes políticos só funcionam no grupo do mandato.';
+    const cargo=cargoPoliticoDoUsuario(grupoJid,usuarioId), g=obterPoliticaGrupo(grupoJid), m=g.mandato;
+    const acao=normalizar(args[0]||'');
+    if(acao==='decreto') {
+        if(cargo!=='prefeito') return 'Somente o prefeito pode publicar decretos.';
+        if(Date.now()-(m.ultimoDecreto||0)<24*3600000) return 'O prefeito já publicou um decreto nas últimas 24 horas.';
+        const conteudo=args.slice(1).join(' ').trim(); if(conteudo.length<5 || conteudo.length>400) return 'Escreva um decreto de 5 a 400 caracteres: !poderpolitico decreto TEXTO.';
+        m.ultimoDecreto=Date.now(); await salvarSistemas310(); return `📜 *DECRETO DA PREFEITURA*\n👑 ${nomeExibicao(usuarioId,nome)}\n\n${conteudo}`;
+    }
+    if(acao==='proteger') {
+        if(cargo!=='vice') return 'Somente o vice-prefeito pode usar Proteção Cívica.';
+        const alvo=obterMencoes(msg)[0]; if(!alvo) return 'Mencione quem receberá a proteção: !poderpolitico proteger @pessoa.';
+        if(Date.now()-(m.ultimaProtecao||0)<60*60*1000) return 'Proteção Cívica em recarga. O vice pode conceder uma proteção por hora.';
+        const jogador=obterJogadorRPG(alvo,nomeExibicao(alvo));
+        m.ultimaProtecao=Date.now(); jogador.escudoPoliticoAte=Date.now()+60*60*1000;
+        await Promise.all([salvarRPG(),salvarSistemas310()]);
+        return `🛡️ Proteção Cívica concedida a ${nomeExibicao(alvo)}. O próximo dano de combate será reduzido por 50%, durante a próxima hora.`;
+    }
+    if(acao==='status') {
+        if(!cargo) return 'Você não ocupa um cargo político ativo neste grupo.';
+        const nomes={prefeito:'Decreto diário: !poderpolitico decreto TEXTO',vice:'Proteção Cívica: !poderpolitico proteger @pessoa',vereador:'Apresentar proposta: !proposta TEXTO'};
+        return `🏛️ Seu cargo: *${cargo.toUpperCase()}*\nPoder: ${nomes[cargo]}`;
+    }
+    return 'Use !poderpolitico status, !poderpolitico decreto TEXTO ou !poderpolitico proteger @pessoa.';
+}
+
+const MASMORRA_NOME = 'Fenda do Crepúsculo';
+const MASMORRA_MAX_ANDAR = 5;
+
+function criarInimigoMasmorra(j, andar) {
+    const chefao = andar === MASMORRA_MAX_ANDAR;
+    const nomes = ['Sentinela de Cinzas', 'Aranha de Obsidiana', 'Cavaleiro Oco', 'Oráculo Corrompido'];
+    const escala = 1 + (j.nivel - 1) * 0.19 + (andar - 1) * 0.32;
+    const hpBase = chefao ? 420 : 95 + andar * 34;
+    const ataqueBase = chefao ? 17 + andar * 3 : 8 + andar * 2;
+    return {
+        nome: chefao ? 'Arauto do Crepúsculo' : aleatorio(nomes),
+        hp: Math.round(hpBase * escala),
+        hpMax: Math.round(hpBase * escala),
+        ataque: Math.round(ataqueBase * escala),
+        defesa: Math.max(1, Math.round((chefao ? 8 : 2 + andar) * escala * 0.45)),
+        chefe: chefao,
+        turno: 0
+    };
+}
+
+function statusMasmorra(j) {
+    const m = j.masmorra || {};
+    if (!m.ativa) return `🕳️ *${MASMORRA_NOME.toUpperCase()}*\n\nVocê está fora da masmorra.\nMelhor andar: ${m.melhorAndar || 0}/${MASMORRA_MAX_ANDAR}\nVitórias: ${m.vitorias || 0}\nTentativas hoje: ${m.tentativasDia || 0}/${3 + (m.acessosExtras || 0)}\nAcessos extras: ${m.acessosExtras || 0}\n\nUse !masmorra entrar para iniciar uma expedição.`;
+    const inimigo = m.inimigo;
+    return `🕳️ *${MASMORRA_NOME.toUpperCase()}*\nAndar: ${m.andar}/${MASMORRA_MAX_ANDAR}\n❤️ Sua vida: ${j.hp}/${j.hpMax}\n${inimigo ? `👹 ${inimigo.nome}: ${inimigo.hp}/${inimigo.hpMax} HP\n${inimigo.chefe ? '👑 CHEFE FINAL\n' : ''}` : '✅ Sala limpa. Use !masmorra avancar.'}\n\n!masmorra atacar | curar | avancar | fugir | status`;
+}
+
+async function processarMasmorra(id, nome, args) {
+    const acao = normalizar(args[0] || 'status');
+    const j = obterJogadorRPG(id, nome);
+    j.masmorra ||= { melhorAndar: 0, vitorias: 0, tentativasDia: 0, dataTentativas: '' };
+    const m = j.masmorra;
+    const hoje = dataLocalISO();
+    if (m.dataTentativas !== hoje) { m.dataTentativas = hoje; m.tentativasDia = 0; m.acessosExtras = 0; }
+    if (m.dataCompras !== hoje) { m.dataCompras = hoje; m.comprasDia = 0; }
+
+    if (acao === 'ajuda' || acao === 'help') {
+        return `🕳️ *FENDA DO CREPÚSCULO*\nUma expedição com cinco andares e um chefe final.\n\n!masmorra entrar — iniciar (3 tentativas por dia)\n!masmorra comprar — comprar +3 acessos por 750 WACoins (1 pacote/dia)\n!masmorra status — ver seu progresso\n!masmorra atacar — atacar o inimigo\n!masmorra curar — usar poção\n!masmorra avancar — seguir para a próxima sala\n!masmorra fugir — abandonar a expedição\n\nRecompensas: XP, moedas RPG, Fragmentos Arcanos e Núcleos Abissais.`;
+    }
+    if (acao === 'status' || acao === 'ver') { await salvarRPG(); return statusMasmorra(j); }
+
+    if (acao === 'comprar' || acao === 'compra') {
+        if (m.ativa) return 'Finalize ou abandone sua expedição antes de comprar novos acessos.';
+        if (m.comprasDia >= 1) return 'Você já comprou seu pacote extra hoje. A loja de acessos reinicia à meia-noite.';
+        const preco = 750;
+        const carteira = obterCarteira(id, nome);
+        if (carteira.saldo < preco) return `Saldo insuficiente. Você tem ${formatarWACoins(carteira.saldo)} e precisa de ${formatarWACoins(preco)}.`;
+        carteira.saldo = Math.round((carteira.saldo - preco) * 100) / 100;
+        m.acessosExtras = Math.min(3, (m.acessosExtras || 0) + 3);
+        m.comprasDia = 1;
+        m.dataCompras = hoje;
+        await Promise.all([salvarWACoins(), salvarRPG()]);
+        return `🛒 *PACOTE DE ACESSOS COMPRADO!*\n\n+3 entradas na Fenda do Crepúsculo.\nPago: ${formatarWACoins(preco)}\nSaldo: ${formatarWACoins(carteira.saldo)}\nTentativas disponíveis hoje: ${Math.max(0, 3 + m.acessosExtras - m.tentativasDia)}/${3 + m.acessosExtras}\n\nUse !masmorra entrar para começar.`;
+    }
+
+    if (acao === 'entrar' || acao === 'iniciar') {
+        if (m.ativa) return 'Você já está dentro da Fenda. Use !masmorra status.';
+        if (j.inimigo) return 'Encerre seu combate normal antes de entrar na masmorra: !rpg fugir.';
+        if (j.hp <= 0) return 'Seu personagem está sem vida. Use !rpg descansar antes de entrar.';
+        if (m.tentativasDia >= 3 + (m.acessosExtras || 0)) return `Você esgotou seus acessos de hoje (${3 + (m.acessosExtras || 0)}). Use !masmorra comprar para adquirir mais 3 por 750 WACoins ou volte amanhã.`;
+        m.tentativasDia++;
+        m.ativa = true; m.andar = 1; m.inimigo = criarInimigoMasmorra(j, 1); m.iniciadaEm = Date.now();
+        await salvarRPG();
+        return `🕳️ *VOCÊ ENTROU NA FENDA!*\nA passagem se fechou atrás de você. São cinco andares; o último guarda o Arauto do Crepúsculo.\n\n${statusMasmorra(j)}`;
+    }
+    if (!m.ativa) return 'Você não está em uma expedição. Use !masmorra entrar.';
+
+    if (acao === 'fugir' || acao === 'sair') {
+        m.ativa = false; m.inimigo = null; m.andar = 0;
+        await salvarRPG();
+        return '🏃 Você abandonou a Fenda e voltou ao acampamento. O progresso desta expedição foi encerrado.';
+    }
+    if (acao === 'avancar' || acao === 'avançar') {
+        if (m.inimigo) return 'Derrote o inimigo desta sala antes de avançar.';
+        if (m.andar >= MASMORRA_MAX_ANDAR) return 'A Fenda já foi concluída. Use !masmorra status.';
+        m.andar++;
+        m.inimigo = criarInimigoMasmorra(j, m.andar);
+        await salvarRPG();
+        return `🚪 *ANDAR ${m.andar}/${MASMORRA_MAX_ANDAR}*\n${m.inimigo.chefe ? '👑 O ARAUTO DO CREPÚSCULO SURGIU!' : `Um ${m.inimigo.nome} bloqueia o caminho.`}\n❤️ Inimigo: ${m.inimigo.hp} HP\nUse !masmorra atacar.`;
+    }
+    if (acao === 'curar') {
+        const itemId = Number(j.inventario.pocao_grande || 0) > 0 ? 'pocao_grande' : 'pocao';
+        const item = RPG_ITENS[itemId];
+        if (Number(j.inventario[itemId] || 0) <= 0) return 'Você não tem poções. A Fenda não permite usar !rpg descansar durante a expedição.';
+        const antes = j.hp;
+        j.hp = Math.min(j.hpMax, j.hp + item.cura);
+        j.inventario[itemId]--;
+        await salvarRPG();
+        return `🧪 ${item.nome}: +${j.hp - antes} HP. Vida: ${j.hp}/${j.hpMax}.`;
+    }
+    if (acao === 'atacar' || acao === 'golpear') {
+        if (!m.inimigo) return 'A sala está vazia. Use !masmorra avancar.';
+        if (j.hp <= 0) return 'Você está sem vida e não pode atacar.';
+        const inimigo = m.inimigo;
+        const classeBonus = j.classe === 'guerreiro' ? 1.12 : 1;
+        const critico = j.classe === 'ladino' && Math.random() < 0.15;
+        const dano = Math.max(1, Math.round((j.ataque + randomInt(0, 8)) * obterMultiplicadorMagiaRPG(j) * classeBonus * (critico ? 1.7 : 1)) - inimigo.defesa);
+        inimigo.hp -= dano;
+        let resposta = `⚔️ Você causou *${dano}* de dano${critico ? ' (CRÍTICO!)' : ''} em ${inimigo.nome}.`;
+        if (inimigo.hp <= 0) {
+            const xp = Math.round((inimigo.chefe ? 520 : 75 + m.andar * 28) * (1 + (j.nivel - 1) * 0.06));
+            const moedas = inimigo.chefe ? 850 : 65 + m.andar * 35;
+            const fragmentos = inimigo.chefe ? 5 : randomInt(1, 3);
+            j.moedas += moedas;
+            j.inventario.fragmento_arcano += fragmentos;
+            if (inimigo.chefe) j.inventario.nucleo_abissal++;
+            const subidas = await adicionarXPRPG(j, xp);
+            resposta += `\n🏆 *${inimigo.nome} derrotado!*\n✨ +${xp} XP\n🪙 +${moedas} moedas RPG\n🔹 +${fragmentos} Fragmento(s) Arcano(s)${inimigo.chefe ? '\n💠 +1 Núcleo Abissal' : ''}${subidas.length ? `\n⭐ Novo nível: ${subidas.join(', ')}` : ''}`;
+            inimigo.hp = 0; m.inimigo = null;
+            if (m.andar > (m.melhorAndar || 0)) m.melhorAndar = m.andar;
+            if (inimigo.chefe) {
+                m.ativa = false; m.andar = 0; m.vitorias++;
+                j.hp = Math.min(j.hpMax, j.hp + Math.ceil(j.hpMax * 0.25));
+                resposta += `\n\n🌟 *FENDA CONCLUÍDA!*\nVocê recebeu uma restauração de 25% da vida. Use !forjar para transformar seus materiais em equipamentos.`;
+            } else {
+                resposta += '\n🚪 Use !masmorra avancar para continuar.';
+            }
+        } else {
+            inimigo.turno++;
+            let recebido = Math.max(1, inimigo.ataque + randomInt(0, 5) - j.defesa);
+            if (j.classe === 'guardiao') recebido = Math.max(1, Math.ceil(recebido * 0.82));
+            if (Date.now() < (j.escudoClasseAte || 0)) { recebido = Math.ceil(recebido * 0.35); j.escudoClasseAte = 0; }
+            j.hp = Math.max(0, j.hp - recebido);
+            resposta += `\n💢 ${inimigo.nome} contra-atacou e causou ${recebido} de dano.\n❤️ Sua vida: ${j.hp}/${j.hpMax}\n👹 Vida do inimigo: ${inimigo.hp}/${inimigo.hpMax}`;
+            if (j.hp <= 0) {
+                m.ativa = false; m.inimigo = null; m.andar = 0;
+                j.hp = Math.max(1, Math.floor(j.hpMax * 0.25));
+                resposta += '\n\n💤 Você foi retirado da Fenda e voltou ao acampamento com 25% da vida. Os materiais já conquistados foram mantidos.';
+            }
+        }
+        await salvarRPG();
+        return resposta;
+    }
+    return 'Ação desconhecida. Use !masmorra ajuda.';
+}
+
+const RECEITAS_RPG = {
+    pocao_grande: { nome: 'Poção grande', materiais: { fragmento_arcano: 3 }, descricao: 'Recupera 100 HP.' },
+    espada_runica: { nome: 'Espada rúnica', materiais: { fragmento_arcano: 6, nucleo_abissal: 1 }, descricao: '+20 de ataque quando equipada.' },
+    escudo_cristal: { nome: 'Escudo de cristal', materiais: { fragmento_arcano: 6, nucleo_abissal: 1 }, descricao: '+16 de defesa quando equipado.' }
+};
+
+async function processarForja(id, nome, args) {
+    const j = obterJogadorRPG(id, nome);
+    const acao = normalizar(args[0] || 'lista').replace(/\s+/g, '_');
+    if (acao === 'lista' || acao === 'ajuda' || acao === 'help') {
+        return `⚒️ *FORJA DO AVENTUREIRO*\n\n${Object.entries(RECEITAS_RPG).map(([id, r]) => `• *${id}* — ${r.nome}\n  ${Object.entries(r.materiais).map(([mat, qtd]) => `${qtd}x ${mat === 'fragmento_arcano' ? 'Fragmento Arcano' : 'Núcleo Abissal'}`).join(' + ')}\n  ${r.descricao}`).join('\n\n')}\n\nMateriais: ${j.inventario.fragmento_arcano || 0} Fragmentos Arcanos | ${j.inventario.nucleo_abissal || 0} Núcleos Abissais\n\nCriar: !forjar espada_runica`;
+    }
+    const receita = RECEITAS_RPG[acao];
+    if (!receita) return 'Receita não encontrada. Use !forjar lista.';
+    for (const [material, quantidade] of Object.entries(receita.materiais)) {
+        if ((Number(j.inventario[material]) || 0) < quantidade) {
+            const nomeMaterial = material === 'fragmento_arcano' ? 'Fragmento Arcano' : 'Núcleo Abissal';
+            return `Materiais insuficientes: faltam ${Math.max(0, quantidade - (Number(j.inventario[material]) || 0))} ${nomeMaterial}(s). Explore a !masmorra.`;
+        }
+    }
+    for (const [material, quantidade] of Object.entries(receita.materiais)) j.inventario[material] -= quantidade;
+    j.inventario[acao] = (Number(j.inventario[acao]) || 0) + 1;
+    await salvarRPG();
+    return `⚒️ *FORJA CONCLUÍDA!*\nVocê criou: *${receita.nome}*\n${receita.descricao}\n🎒 Quantidade no inventário: ${j.inventario[acao]}\n\n${['espada_runica','escudo_cristal'].includes(acao) ? `Use !rpg equipar ${acao} para equipar.` : 'Use !rpg curar pocao_grande para utilizar.'}`;
+}
+
+const RPG_TRABALHOS = {
+    agricultor: { nome: 'Agricultor', nivel: 1, minimo: 55, maximo: 90, xp: 18, recurso: 'trigo', qtd: [2, 4] },
+    lenhador: { nome: 'Lenhador', nivel: 2, minimo: 70, maximo: 110, xp: 22, recurso: 'madeira', qtd: [2, 4] },
+    minerador: { nome: 'Minerador', nivel: 4, minimo: 95, maximo: 145, xp: 28, recurso: 'pedra', qtd: [2, 3] },
+    herbalista: { nome: 'Herbalista', nivel: 3, minimo: 80, maximo: 125, xp: 25, recurso: 'ervas', qtd: [2, 4] }
+};
+const RPG_CULTIVOS = {
+    trigo: { nome: 'Trigo', semente: 35, tempo: 60 * 60 * 1000, rendimento: [3, 5], venda: 28, recurso: 'trigo' },
+    ervas: { nome: 'Ervas medicinais', semente: 55, tempo: 2 * 60 * 60 * 1000, rendimento: [2, 4], venda: 48, recurso: 'ervas' },
+    madeira: { nome: 'Mudas de madeira', semente: 70, tempo: 3 * 60 * 60 * 1000, rendimento: [2, 4], venda: 62, recurso: 'madeira' }
+};
+const RPG_EDIFICIOS_CIDADE = {
+    fazenda: { nome: 'Fazenda comunitária', custo: 1800, recurso: 'madeira', materialQtd: 12, bonus: 'Aumenta em 10% a recompensa de trabalhos de agricultor para membros.' },
+    serraria: { nome: 'Serraria', custo: 2200, recurso: 'madeira', materialQtd: 20, bonus: 'Desbloqueia a produção comunitária de madeira.' },
+    pedreira: { nome: 'Pedreira', custo: 2600, recurso: 'pedra', materialQtd: 18, bonus: 'Desbloqueia a produção comunitária de pedra.' },
+    mercado: { nome: 'Mercado central', custo: 3200, recurso: 'madeira', materialQtd: 25, bonus: 'Aumenta em 5% o valor recebido ao vender colheitas.' },
+    muralha: { nome: 'Muralha', custo: 4000, recurso: 'pedra', materialQtd: 35, bonus: 'Aumenta a reputação e a defesa da cidade.' }
+};
+
+async function processarEconomiaRPG(id, nome, args, j) {
+    const acao = normalizar(args[0] || '');
+    const e = j.economia;
+    sistemasV310.cidades ||= {};
+    sistemasV310.membrosCidade ||= {};
+    const chaveCidade = encontrarChaveUsuario(sistemasV310.membrosCidade, id);
+    const cidadeId = chaveCidade ? sistemasV310.membrosCidade[chaveCidade] : null;
+    const cidade = cidadeId ? sistemasV310.cidades[cidadeId] : null;
+    if (cidade) { cidade.membros ||= []; cidade.edificios ||= {}; cidade.estoque ||= { madeira: 0, pedra: 0, trigo: 0, ervas: 0 }; cidade.tesouro = Math.max(0, Number(cidade.tesouro) || 0); }
+    const salvarTudo = async () => Promise.all([salvarRPG(), salvarSistemas310()]);
+
+    if (acao === 'fazenda') {
+        const sub = normalizar(args[1] || 'status');
+        if (sub === 'loja' || sub === 'comprar') {
+            if (e.fazendas >= 3) return '🌾 Você já possui o limite de 3 terrenos agrícolas.';
+            const custo = 800 + e.fazendas * 650;
+            if (j.moedas < custo) return `Você precisa de ${custo} moedas RPG. Saldo: ${j.moedas}.`;
+            j.moedas -= custo; e.fazendas++;
+            await salvarRPG();
+            return `🌱 *NOVO TERRENO ADQUIRIDO!*\nTerrenos: ${e.fazendas}/3\nCusto: ${custo} moedas RPG\n\nPlante com !rpg plantar trigo, ervas ou madeira.`;
+        }
+        if (sub === 'vender') {
+            const recurso = normalizar(args[2] || 'trigo');
+            const cultura = RPG_CULTIVOS[recurso];
+            const qtd = Math.max(1, Math.floor(Number(args[3]) || 1));
+            if (!cultura || e.recursos[cultura.recurso] < qtd) return `Você não possui essa quantidade. Recursos: ${JSON.stringify(e.recursos)}.`;
+            let preco = cultura.venda * qtd;
+            if (cidade?.edificios?.mercado) preco = Math.floor(preco * 1.05);
+            e.recursos[cultura.recurso] -= qtd; j.moedas += preco;
+            await salvarRPG();
+            return `🧺 Venda concluída: ${qtd} unidade(s) de ${cultura.nome}.\n🪙 +${preco} moedas RPG.`;
+        }
+        if (sub === 'status' || sub === 'ver') {
+            const plantio = e.plantacao ? `${RPG_CULTIVOS[e.plantacao.tipo]?.nome || e.plantacao.tipo}: ${Date.now() >= e.plantacao.colheitaEm ? 'PRONTO PARA COLHER' : `pronto em ${Math.ceil((e.plantacao.colheitaEm-Date.now())/60000)} min`}` : 'Nenhum plantio ativo';
+            return `🌾 *SUA FAZENDA*\nTerrenos: ${e.fazendas}/3\nPlantio: ${plantio}\n\nRecursos: trigo ${e.recursos.trigo} | ervas ${e.recursos.ervas} | madeira ${e.recursos.madeira} | pedra ${e.recursos.pedra}\n\n!rpg fazenda comprar\n!rpg plantar TIPO\n!rpg colher\n!rpg fazenda vender TIPO QUANTIDADE`;
+        }
+        return 'Use !rpg fazenda | !rpg fazenda comprar | !rpg fazenda vender trigo 3.';
+    }
+    if (acao === 'plantar') {
+        const tipo = normalizar(args[1] || ''); const cultura = RPG_CULTIVOS[tipo];
+        if (!cultura) return 'Cultivo inválido. Escolha trigo, ervas ou madeira.';
+        if (e.fazendas < 1) return 'Você precisa comprar um terreno: !rpg fazenda comprar.';
+        if (e.plantacao) return 'Você já tem um plantio ativo. Use !rpg colher quando estiver pronto.';
+        if (j.moedas < cultura.semente) return `Sementes custam ${cultura.semente} moedas RPG.`;
+        j.moedas -= cultura.semente;
+        e.plantacao = { tipo, iniciadoEm: Date.now(), colheitaEm: Date.now() + cultura.tempo };
+        await salvarRPG();
+        return `🌱 *PLANTIO REALIZADO*\nCultivo: ${cultura.nome}\nCusto das sementes: ${cultura.semente} moedas RPG\nTempo: ${Math.round(cultura.tempo/3600000*10)/10} hora(s)\nUse !rpg colher quando estiver pronto.`;
+    }
+    if (acao === 'colher') {
+        if (!e.plantacao) return 'Você não tem nenhuma plantação ativa.';
+        if (Date.now() < e.plantacao.colheitaEm) return `🌿 A plantação ainda está crescendo. Faltam ${Math.ceil((e.plantacao.colheitaEm-Date.now())/60000)} minuto(s).`;
+        const tipo = e.plantacao.tipo; const cultura = RPG_CULTIVOS[tipo];
+        const qtd = randomInt(cultura.rendimento[0], cultura.rendimento[1] + 1) * Math.max(1, Math.min(3, e.fazendas));
+        e.recursos[cultura.recurso] += qtd; e.plantacao = null;
+        await salvarRPG();
+        return `🌾 *COLHEITA CONCLUÍDA!*\nVocê recebeu ${qtd} unidade(s) de ${cultura.nome}.\nTotal armazenado: ${e.recursos[cultura.recurso]}.\nVenda com !rpg fazenda vender ${tipo} ${qtd}.`;
+    }
+    if (acao === 'trabalhos' || acao === 'empregos') {
+        return `🧰 *CENTRAL DE TRABALHOS*\n\n${Object.entries(RPG_TRABALHOS).map(([key,t])=>`• *${key}* — ${t.nome}\nNível mínimo: ${t.nivel} | Salário: ${t.minimo}–${t.maximo} moedas | +${t.xp} XP`).join('\n\n')}\n\nEscolher: !rpg emprego NOME\nTrabalhar: !rpg trabalhar`;
+    }
+    if (acao === 'emprego') {
+        const tipo = normalizar(args[1] || ''); const trabalho = RPG_TRABALHOS[tipo];
+        if (!trabalho) return 'Emprego inválido. Use !rpg trabalhos.';
+        if (j.nivel < trabalho.nivel) return `Você precisa estar no nível ${trabalho.nivel} para exercer essa profissão.`;
+        e.emprego = tipo; await salvarRPG();
+        return `📋 *CONTRATO DE TRABALHO ASSINADO*\nProfissão: ${trabalho.nome}\nSalário por expediente: ${trabalho.minimo}–${trabalho.maximo} moedas RPG\nUse !rpg trabalhar. Há intervalo de 4 horas entre expedientes.`;
+    }
+    if (acao === 'trabalhar') {
+        if (!e.emprego || !RPG_TRABALHOS[e.emprego]) return 'Você ainda não tem profissão. Use !rpg trabalhos e depois !rpg emprego NOME.';
+        if (Date.now() < e.trabalhoAte) return `⏳ Você já trabalhou recentemente. Próximo expediente em ${Math.ceil((e.trabalhoAte-Date.now())/60000)} minuto(s).`;
+        const t = RPG_TRABALHOS[e.emprego];
+        if (j.nivel < t.nivel) return `Seu nível atual não atende ao requisito ${t.nivel}.`;
+        const salario = randomInt(t.minimo, t.maximo + 1) + Math.floor(j.nivel * 3);
+        const qtd = randomInt(t.qtd[0], t.qtd[1] + 1);
+        const bonusCidade = cidade?.edificios?.fazenda && e.emprego === 'agricultor' ? Math.floor(salario * .10) : 0;
+        j.moedas += salario + bonusCidade; e.recursos[t.recurso] += qtd; e.trabalhoAte = Date.now() + 4 * 60 * 60 * 1000;
+        const subidas = await adicionarXPRPG(j, t.xp);
+        await salvarRPG();
+        return `🧰 *EXPEDIENTE CONCLUÍDO*\nProfissão: ${t.nome}\nSalário: ${salario + bonusCidade} moedas RPG\nProdução: +${qtd} ${t.recurso}\nExperiência: +${t.xp} XP${subidas.length ? `\nNível alcançado: ${j.nivel}` : ''}\nPróximo expediente em 4 horas.`;
+    }
+    if (acao === 'cidade') {
+        const sub = normalizar(args[1] || 'status');
+        if (sub === 'criar') {
+            const nomeCidade = args.slice(2).join(' ').trim().replace(/[\n\r]/g, ' ');
+            if (cidade) return 'Você já faz parte de uma cidade. Saia dela antes de fundar outra.';
+            if (nomeCidade.length < 3 || nomeCidade.length > 26) return 'Nome da cidade: 3 a 26 caracteres. Ex.: !rpg cidade criar Nova Aurora.';
+            if (j.moedas < 5000) return `Fundar uma cidade custa 5.000 moedas RPG. Seu saldo: ${j.moedas}.`;
+            if (Object.values(sistemasV310.cidades).some(c => normalizar(c.nome) === normalizar(nomeCidade))) return 'Já existe uma cidade com esse nome.';
+            const novoId = `C${Date.now().toString(36).toUpperCase()}`;
+            j.moedas -= 5000;
+            sistemasV310.cidades[novoId] = { id: novoId, nome: nomeCidade, lider: id, membros: [id], tesouro: 0, nivel: 1, reputacao: 0, edificios: {}, estoque: { madeira: 0, pedra: 0, trigo: 0, ervas: 0 }, criadaEm: Date.now() };
+            sistemasV310.membrosCidade[id] = novoId;
+            await salvarTudo();
+            return `🏙️ *CIDADE FUNDADA: ${nomeCidade.toUpperCase()}*\nID: ${novoId}\nFundador: ${nome}\nNível: 1\nTesouro: 0\n\nConvide outros jogadores compartilhando o ID. Eles podem usar !rpg cidade entrar ${novoId}.`;
+        }
+        if (sub === 'entrar') {
+            const alvo = sistemasV310.cidades[String(args[2] || '').toUpperCase()];
+            if (!alvo) return 'Cidade não encontrada. Peça o ID ao fundador.';
+            if (cidade) return `Você já pertence a ${cidade.nome}.`;
+            if (alvo.membros.length >= 30) return 'Essa cidade atingiu o limite de 30 moradores.';
+            alvo.membros.push(id); sistemasV310.membrosCidade[id] = alvo.id;
+            await salvarSistemas310();
+            return `🏡 Você agora é morador(a) de *${alvo.nome}*! Ajude com !rpg cidade ajudar VALOR.`;
+        }
+        if (sub === 'sair') {
+            if (!cidade) return 'Você não pertence a uma cidade.';
+            if (mesmoUsuario(cidade.lider,id)) return 'O fundador não pode sair da própria cidade. Transfira a liderança (futura função) ou mantenha a cidade.';
+            cidade.membros = cidade.membros.filter(m => !mesmoUsuario(m,id)); delete sistemasV310.membrosCidade[chaveCidade];
+            await salvarSistemas310(); return `Você saiu de ${cidade.nome}.`;
+        }
+        if (sub === 'ajudar' || sub === 'doar') {
+            if (!cidade) return 'Você precisa morar em uma cidade para contribuir.';
+            const valor = Math.floor(Number(args[2]));
+            if (!Number.isInteger(valor) || valor < 1 || j.moedas < valor) return `Informe um valor válido de moedas RPG. Saldo: ${j.moedas}.`;
+            j.moedas -= valor; cidade.tesouro += valor; cidade.reputacao += Math.max(1, Math.floor(valor/100));
+            await salvarTudo(); return `🤝 Você contribuiu com ${valor} moedas RPG para ${cidade.nome}.\nTesouro: ${cidade.tesouro} | Reputação: ${cidade.reputacao}.`;
+        }
+        if (sub === 'doar') {
+            if (!cidade) return 'Você precisa pertencer a uma cidade.';
+            const recurso = normalizar(args[2] || ''); const qtd = Math.floor(Number(args[3]));
+            if (!['madeira','pedra','trigo','ervas'].includes(recurso) || !Number.isInteger(qtd) || qtd < 1 || e.recursos[recurso] < qtd) return 'Use !rpg cidade doar madeira|pedra|trigo|ervas QUANTIDADE e tenha os recursos no estoque pessoal.';
+            e.recursos[recurso] -= qtd; cidade.estoque[recurso] = (Number(cidade.estoque[recurso]) || 0) + qtd; cidade.reputacao += Math.max(1, Math.floor(qtd/5));
+            await salvarTudo(); return `📦 Você doou ${qtd} ${recurso} para ${cidade.nome}. Estoque comunitário: ${cidade.estoque[recurso]}.`;
+        }
+        if (sub === 'construir') {
+            if (!cidade) return 'Você precisa pertencer a uma cidade.';
+            if (!mesmoUsuario(cidade.lider,id)) return 'Somente o fundador pode autorizar construções nesta versão.';
+            const tipo = normalizar(args[2] || ''); const edificio = RPG_EDIFICIOS_CIDADE[tipo];
+            if (!edificio) return `Edifício inválido. Opções: ${Object.keys(RPG_EDIFICIOS_CIDADE).join(', ')}.`;
+            if (cidade.edificios[tipo]) return 'Esse edifício já foi construído.';
+            if (cidade.tesouro < edificio.custo) return `Tesouro insuficiente. ${edificio.nome} custa ${edificio.custo}; tesouro atual: ${cidade.tesouro}.`;
+            if ((Number(cidade.estoque[edificio.recurso]) || 0) < edificio.materialQtd) return `Materiais insuficientes: ${edificio.nome} exige ${edificio.materialQtd} ${edificio.recurso}. Estoque: ${cidade.estoque[edificio.recurso] || 0}. Doe com !rpg cidade doar ${edificio.recurso} QUANTIDADE.`;
+            cidade.tesouro -= edificio.custo; cidade.estoque[edificio.recurso] -= edificio.materialQtd; cidade.edificios[tipo] = { nivel: 1, construidaEm: Date.now() }; cidade.nivel += 1;
+            await salvarSistemas310(); return `🏗️ *OBRA CONCLUÍDA: ${edificio.nome.toUpperCase()}*\n${edificio.bonus}\nNível da cidade: ${cidade.nivel}\nTesouro restante: ${cidade.tesouro}.`;
+        }
+        if (sub === 'status' || sub === 'ver' || sub === 'ranking') {
+            if (sub === 'ranking') {
+                const top = Object.values(sistemasV310.cidades).sort((a,b) => (b.nivel-a.nivel) || (b.reputacao-a.reputacao)).slice(0,10);
+                return `🏙️ *CIDADES DO MUNDO*\n\n${top.length ? top.map((c,i)=>`${i+1}. ${c.nome} — nível ${c.nivel}, ${c.membros.length} moradores, reputação ${c.reputacao}`).join('\n') : 'Nenhuma cidade fundada ainda.'}`;
+            }
+            if (!cidade) return 'Você ainda não pertence a uma cidade. Use !rpg cidade ranking ou !rpg cidade criar NOME.';
+            return `🏙️ *${cidade.nome.toUpperCase()}*\nID: ${cidade.id}\nFundador: ${nomeExibicao(cidade.lider)}\nNível: ${cidade.nivel}\nMoradores: ${cidade.membros.length}/30\nTesouro: ${cidade.tesouro} moedas RPG\nReputação: ${cidade.reputacao}\nEdifícios: ${Object.keys(cidade.edificios).map(k=>RPG_EDIFICIOS_CIDADE[k]?.nome || k).join(', ') || 'Nenhum'}\nEstoque: madeira ${cidade.estoque.madeira} | pedra ${cidade.estoque.pedra} | trigo ${cidade.estoque.trigo} | ervas ${cidade.estoque.ervas}\n\n!rpg cidade ajudar VALOR\n!rpg cidade doar RECURSO QTD\n!rpg cidade construir EDIFICIO\n!rpg cidade sair`;
+        }
+        return '🏙️ !rpg cidade criar NOME | entrar ID | status | ranking | ajudar VALOR | doar RECURSO QTD | construir EDIFICIO | sair';
+    }
+    return null;
+}
+
+// ==================================================
+// WABOT POKER — Texas Hold'em simplificado contra o bot
+// Sem apostas, sem WACoins e sem dinheiro real: partidas por pontuação.
+// ==================================================
+const NAIPES_POKER = ['♠', '♥', '♦', '♣'];
+const NOMES_MAO_POKER = ['Carta alta', 'Par', 'Dois pares', 'Trinca', 'Sequência', 'Flush', 'Full house', 'Quadra', 'Straight flush'];
+function criarBaralhoPoker() {
+    const cartas=[];
+    for (const naipe of NAIPES_POKER) for (let valor=2; valor<=14; valor++) cartas.push({valor,naipe});
+    for (let i=cartas.length-1;i>0;i--) { const j=randomInt(i+1); [cartas[i],cartas[j]]=[cartas[j],cartas[i]]; }
+    return cartas;
+}
+function avaliarMaoPoker(mao) {
+    const valores=mao.map(c=>c.valor).sort((a,b)=>b-a);
+    const contagem={}; valores.forEach(v=>contagem[v]=(contagem[v]||0)+1);
+    const grupos=Object.entries(contagem).map(([v,q])=>({v:Number(v),q})).sort((a,b)=>b.q-a.q||b.v-a.v);
+    const flush=mao.every(c=>c.naipe===mao[0].naipe);
+    const unicos=[...new Set(valores)].sort((a,b)=>b-a);
+    let straight=false, topo=0;
+    if(unicos.length===5) {
+        if(unicos[0]-unicos[4]===4) { straight=true; topo=unicos[0]; }
+        else if(unicos.join(',')==='14,5,4,3,2') { straight=true; topo=5; }
+    }
+    let categoria=0, desempate=[];
+    if(straight&&flush){categoria=8;desempate=[topo];}
+    else if(grupos[0].q===4){categoria=7;desempate=[grupos[0].v,grupos[1].v];}
+    else if(grupos[0].q===3&&grupos[1].q===2){categoria=6;desempate=[grupos[0].v,grupos[1].v];}
+    else if(flush){categoria=5;desempate=valores;}
+    else if(straight){categoria=4;desempate=[topo];}
+    else if(grupos[0].q===3){categoria=3;desempate=[grupos[0].v,...grupos.slice(1).map(x=>x.v).sort((a,b)=>b-a)];}
+    else if(grupos[0].q===2&&grupos[1].q===2){categoria=2;desempate=[Math.max(grupos[0].v,grupos[1].v),Math.min(grupos[0].v,grupos[1].v),grupos[2].v];}
+    else if(grupos[0].q===2){categoria=1;desempate=[grupos[0].v,...grupos.slice(1).map(x=>x.v).sort((a,b)=>b-a)];}
+    else {categoria=0;desempate=valores;}
+    return {categoria,desempate,nome:NOMES_MAO_POKER[categoria]};
+}
+function compararMaosPoker(a,b) {
+    const x=avaliarMaoPoker(a),y=avaliarMaoPoker(b);
+    if(x.categoria!==y.categoria)return x.categoria>y.categoria?1:-1;
+    for(let i=0;i<Math.max(x.desempate.length,y.desempate.length);i++) if((x.desempate[i]||0)!==(y.desempate[i]||0)) return (x.desempate[i]||0)>(y.desempate[i]||0)?1:-1;
+    return 0;
+}
+function nomeValorPoker(v){return ({11:'J',12:'Q',13:'K',14:'A'})[v]||String(v);}
+function cartaTextoPoker(c){return `${nomeValorPoker(c.valor)}${c.naipe}`;}
+function decidirTrocaBotPoker(mao,dificuldade){
+    const evalMao=avaliarMaoPoker(mao), cont={}; mao.forEach(c=>cont[c.valor]=(cont[c.valor]||0)+1);
+    const grupos=Object.entries(cont).map(([v,q])=>({v:Number(v),q})).sort((a,b)=>b.q-a.q||b.v-a.v);
+    if(evalMao.categoria>=4) return [];
+    if(evalMao.categoria===3) return mao.map((c,i)=>cont[c.valor]===3?-1:i).filter(i=>i>=0);
+    if(evalMao.categoria===2) return mao.map((c,i)=>cont[c.valor]===2?-1:i).filter(i=>i>=0);
+    if(evalMao.categoria===1) return mao.map((c,i)=>cont[c.valor]===2?-1:i).filter(i=>i>=0);
+    const flushSuit=NAIPES_POKER.find(n=>mao.filter(c=>c.naipe===n).length>=4);
+    if(flushSuit && dificuldade!=='facil') return mao.map((c,i)=>c.naipe===flushSuit?-1:i).filter(i=>i>=0);
+    const vals=[...new Set(mao.map(c=>c.valor))];
+    let straightKeep=null;
+    for(let start=2;start<=10;start++){
+        const seq=[start,start+1,start+2,start+3,start+4];
+        const keep=mao.map((c,i)=>seq.includes(c.valor)?i:-1).filter(i=>i>=0);
+        if(keep.length>=4 && (!straightKeep||keep.length>straightKeep.length))straightKeep=keep;
+    }
+    if(dificuldade==='dificil' && !straightKeep){
+        const wheel=[14,2,3,4,5], keep=mao.map((c,i)=>wheel.includes(c.valor)?i:-1).filter(i=>i>=0);
+        if(keep.length>=4) straightKeep=keep;
+    }
+    if(straightKeep && dificuldade!=='facil') return mao.map((c,i)=>straightKeep.includes(i)?-1:i).filter(i=>i>=0);
+    const maior=grupos[0]?.v||2;
+    if(dificuldade==='dificil') {
+        const altas=mao.map((c,i)=>({c,i})).filter(x=>x.c.valor>=11).sort((a,b)=>b.c.valor-a.c.valor);
+        if(altas.length>=2) { const manter=altas.slice(0,2).map(x=>x.i); return mao.map((c,i)=>manter.includes(i)?-1:i).filter(i=>i>=0); }
+    }
+    if(dificuldade==='facil'){
+        const manter=mao.map((c,i)=>c.valor===maior?i:-1).filter(i=>i>=0);
+        const extras=mao.map((c,i)=>i).filter(i=>!manter.includes(i));
+        const q=Math.min(extras.length,randomInt(1,4));
+        return extras.slice(0,q);
+    }
+    return mao.map((c,i)=>c.valor===maior?-1:i).filter(i=>i>=0);
+}
+function escaparSVGPoker(v){return String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');}
+async function gerarImagemPoker(partida,revelar=false,resultado=''){
+    const W=1100,H=690; let svg=`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">
+    <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#101827"/><stop offset="1" stop-color="#263b32"/></linearGradient><linearGradient id="felt" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#176447"/><stop offset="1" stop-color="#0b3b2d"/></linearGradient></defs>
+    <rect width="1100" height="690" rx="30" fill="url(#bg)"/><text x="550" y="55" text-anchor="middle" font-family="Arial" font-size="34" font-weight="bold" fill="#f5d58a">WABOT POKER</text>
+    <rect x="55" y="85" width="990" height="540" rx="240" fill="#4c3828" stroke="#d2ad67" stroke-width="8"/><rect x="72" y="102" width="956" height="506" rx="230" fill="url(#felt)" stroke="#b98d4e" stroke-width="3"/>
+    <text x="550" y="145" text-anchor="middle" font-family="Arial" font-size="23" fill="#e8f4e9">${escaparSVGPoker(partida.botNome||'WABOT')} • ${revelar?avaliarMaoPoker(partida.bot).nome:'MÃO OCULTA'}</text>
+    <text x="550" y="565" text-anchor="middle" font-family="Arial" font-size="23" fill="#e8f4e9">${escaparSVGPoker(partida.nome)} • ${avaliarMaoPoker(partida.jogador).nome}</text>`;
+    const desenhar=(c,x,y,oculta=false)=>{
+      if(oculta){svg+=`<rect x="${x}" y="${y}" width="112" height="158" rx="12" fill="#263c70" stroke="#e4c77f" stroke-width="4"/><rect x="${x+9}" y="${y+9}" width="94" height="140" rx="7" fill="none" stroke="#d8bd7a" stroke-width="2"/><text x="${x+56}" y="${y+94}" text-anchor="middle" font-size="48" fill="#e7d39c">✦</text>`;return;}
+      const vermelho=['♥','♦'].includes(c.naipe),cor=vermelho?'#c8323c':'#18202b',v=nomeValorPoker(c.valor);
+      svg+=`<rect x="${x}" y="${y}" width="112" height="158" rx="12" fill="#fffdf6" stroke="#d8c9a5" stroke-width="3"/><text x="${x+13}" y="${y+31}" font-family="Arial" font-size="25" font-weight="bold" fill="${cor}">${v}</text><text x="${x+56}" y="${y+93}" text-anchor="middle" font-family="Arial" font-size="48" fill="${cor}">${c.naipe}</text><text x="${x+98}" y="${y+143}" text-anchor="end" font-family="Arial" font-size="22" fill="${cor}">${v}</text>`;
+    };
+    const x0=550-((5*112+4*12)/2);
+    for(let i=0;i<5;i++){desenhar(partida.bot[i],x0+i*124,175,!revelar);desenhar(partida.jogador[i],x0+i*124,365,false);}
+    svg+=`<text x="550" y="350" text-anchor="middle" font-family="Arial" font-size="15" fill="#f5d58a">${revelar?escaparSVGPoker(resultado):'TROQUE OU MANTENHA'}</text>
+    <text x="550" y="660" text-anchor="middle" font-family="Arial" font-size="16" fill="#cbd5cf">Dificuldade: ${partida.dificuldade.toUpperCase()} • Partida sem apostas ou dinheiro</text></svg>`;
+    return sharp(Buffer.from(svg)).png({compressionLevel:9}).toBuffer();
+}
+async function enviarMesaPoker(sock,jid,partida,revelar=false,resultado=''){
+    const imagem=await gerarImagemPoker(partida,revelar,resultado);
+    const legenda=revelar
+      ? `♠️ *RESULTADO DO WABOT POKER*\n\nVocê: *${avaliarMaoPoker(partida.jogador).nome}*\nWABOT: *${avaliarMaoPoker(partida.bot).nome}*\n\n${resultado}\n\nPlacar da partida: ${partida.placarTexto||'—'}\nNova partida: !poker iniciar [facil|normal|dificil]`
+      : `♠️ *WABOT POKER — 5 CARTAS*\n\nSua mão: ${partida.jogador.map((c,i)=>`${i+1}. ${cartaTextoPoker(c)}`).join('  |  ')}\n\nTroque cartas: *!poker trocar 1 3 5*\nOu mantenha: *!poker manter*\nDificuldade: *${partida.dificuldade}*\n\nO bot mantém suas cartas escondidas até o resultado.`;
+    await enviar(sock,jid,{image:imagem,caption:legenda});
+}
+async function concluirPoker(sock,jid,chave,partida,deck){
+    const descartar=decidirTrocaBotPoker(partida.bot,partida.dificuldade);
+    for(const i of descartar) partida.bot[i]=deck.pop();
+    const cmp=compararMaosPoker(partida.jogador,partida.bot);
+    const placar=sistemasV310.poker ||= {};
+    const reg=placar[partida.id] ||= {nome:partida.nome,vitorias:0,derrotas:0,empates:0,partidas:0};
+    reg.nome=partida.nome;reg.partidas++;
+    let resultado;
+    if(cmp>0){reg.vitorias++;resultado='🏆 Você venceu! Sua mão superou a do WABOT.';}
+    else if(cmp<0){reg.derrotas++;resultado='🤖 O WABOT venceu desta vez. Tente novamente!';}
+    else{reg.empates++;resultado='🤝 Empate! As mãos têm o mesmo valor.';}
+    await salvarSistemas310();
+    partida.placarTexto=`${reg.vitorias}V / ${reg.derrotas}D / ${reg.empates}E`;
+    partidasPoker.delete(chave);
+    await enviarMesaPoker(sock,jid,partida,true,resultado);
+}
+async function processarPoker(sock,jid,id,nome,args){
+    const chave=`${jid}:${id}`,acao=normalizar(args[0]||'ajuda');
+    const dificuldades=['facil','normal','dificil'];
+    if(acao==='ajuda'||acao==='') return `♠️ *WABOT POKER — COMO JOGAR*\n\nVocê joga uma partida individual contra o WABOT, usando cinco cartas. Cada um recebe uma mão e pode trocar cartas uma vez. A melhor combinação vence.\n\n!poker iniciar [facil|normal|dificil]\n!poker dificuldade facil|normal|dificil\n!poker trocar 1 3 5 — trocar posições\n!poker manter — finalizar sem trocar\n!poker mesa — ver a mesa\n!poker sair — encerrar\n!poker ranking — suas estatísticas\n\nCombinações: carta alta, par, dois pares, trinca, sequência, flush, full house, quadra e straight flush.\nNão existem apostas, perdas de moedas ou dinheiro real.`;
+    if(acao==='dificuldade'){
+        const d=normalizar(args[1]||''); if(!dificuldades.includes(d)) return 'Escolha: facil, normal ou dificil. Exemplo: !poker dificuldade dificil';
+        dificuldadePoker.set(chave,d);return `🎚️ Dificuldade definida: *${d.toUpperCase()}*. Ela será usada na próxima partida.`;
+    }
+    if(acao==='ranking'){
+        const r=sistemasV310.poker?.[id]; if(!r)return 'Você ainda não jogou Poker. Use !poker iniciar.';
+        return `♠️ *SEU HISTÓRICO DE POKER*\n\nJogador: ${r.nome||nome}\nPartidas: ${r.partidas||0}\nVitórias: ${r.vitorias||0}\nDerrotas: ${r.derrotas||0}\nEmpates: ${r.empates||0}`;
+    }
+    const partida=partidasPoker.get(chave);
+    if(acao==='sair'||acao==='desistir') {if(!partida)return 'Você não tem uma partida de Poker ativa.';partidasPoker.delete(chave);return '🚪 Partida encerrada. Nenhuma pontuação foi alterada.';}
+    if(acao==='iniciar'||acao==='start'){
+        if(partida)return 'Você já tem uma partida ativa. Use !poker mesa, !poker trocar ou !poker manter.';
+        const d=normalizar(args[1]||dificuldadePoker.get(chave)||'normal');if(!dificuldades.includes(d))return 'Dificuldade inválida. Use facil, normal ou dificil.';
+        const deck=criarBaralhoPoker(),jogador=deck.splice(0,5),bot=deck.splice(0,5);
+        const nova={id,nome,botNome:'WABOT',dificuldade:d,jogador,bot,deck,criadoEm:Date.now()};partidasPoker.set(chave,nova);
+        await enviarMesaPoker(sock,jid,nova,false);return null;
+    }
+    if(!partida)return 'Nenhuma partida ativa. Comece com !poker iniciar [facil|normal|dificil].';
+    if(acao==='mesa'||acao==='status'||acao==='mao'){await enviarMesaPoker(sock,jid,partida,false);return null;}
+    if(acao==='manter'||acao==='finalizar'){
+        await concluirPoker(sock,jid,chave,partida,partida.deck);return null;
+    }
+    if(acao==='trocar'){
+        if(partida.trocou)return 'Você já trocou cartas nesta rodada. Use !poker manter para revelar o resultado.';
+        const indices=[...new Set(args.slice(1).map(x=>Number(x)-1))];
+        if(!indices.length||indices.some(i=>!Number.isInteger(i)||i<0||i>4))return 'Informe posições de 1 a 5. Exemplo: !poker trocar 1 3 5';
+        for(const i of indices)partida.jogador[i]=partida.deck.pop();
+        partida.trocou=true;await concluirPoker(sock,jid,chave,partida,partida.deck);return null;
+    }
+    return 'Comando inválido. Use !poker ajuda.';
+}
+
+async function processarRPG(id, nome, args, grupoJid = '') {
     const acao = normalizar(args[0] || 'status');
     const j = obterJogadorRPG(id, nome);
     let msg = '';
+    if (j.masmorra?.ativa && !['status', 'perfil', 'magias', 'poderes', 'magia'].includes(acao)) {
+        return '🕳️ Você está dentro da Fenda do Crepúsculo. Para evitar combates simultâneos, use !masmorra atacar/curar/avancar/fugir até concluir a expedição.';
+    }
+    const economiaResposta = await processarEconomiaRPG(id, nome, args, j);
+    if (economiaResposta !== null) return economiaResposta;
 
+    if (acao === 'classe') {
+        const escolhida=normalizar(args[1]||'').replace(/\s+/g,'');
+        if(!args[1]) return `🧬 *CLASSES RPG*\n\n${Object.entries(RPG_CLASSES).map(([id,c])=>`• *${id}* — ${c.nome}\nPassiva: ${c.passiva}\nHabilidade: ${c.habilidade}`).join('\n\n')}\n\nEscolher: !rpg classe guerreiro/mago/guardiao/ladino. A primeira escolha é grátis; trocar custa 250 moedas RPG.`;
+        if(!RPG_CLASSES[escolhida]) return 'Classe inválida. Use !rpg classe para ver as opções.';
+        if(j.classe===escolhida) return `Você já é ${RPG_CLASSES[escolhida].nome}.`;
+        if(j.classe && j.moedas<250) return 'Trocar de classe custa 250 moedas RPG.';
+        if(j.classe) j.moedas-=250;
+        j.classe=escolhida; await salvarRPG();
+        return `🧬 *CLASSE DEFINIDA: ${RPG_CLASSES[escolhida].nome.toUpperCase()}*\nPassiva: ${RPG_CLASSES[escolhida].passiva}\nHabilidade: ${RPG_CLASSES[escolhida].habilidade}${j.moedas<250?'':'\nTroca de classe: 250 moedas RPG.'}`;
+    }
+    if (acao === 'habilidade') {
+        if(!j.classe) return 'Escolha uma classe primeiro: !rpg classe.';
+        if(!j.inimigo) return 'Você precisa estar em combate para usar sua habilidade. Use !rpg explorar.';
+        if(Date.now()<(j.habilidadeCooldownAte||0)) return `Habilidade em recarga. Aguarde ${Math.ceil((j.habilidadeCooldownAte-Date.now())/1000)} segundo(s).`;
+        const agora=Date.now(); j.habilidadeCooldownAte=agora+90000;
+        let descricao='';
+        if(j.classe==='guerreiro') { j.bonusProximoAtaque=1.75; j.bonusProximoAtaqueAte=agora+60000; descricao='⚔️ Fúria ativada: seu próximo ataque causa 75% de dano adicional.'; }
+        else if(j.classe==='mago') { j.bonusProximaMagia=1.5; j.bonusProximaMagiaAte=agora+60000; descricao='✨ Sobrecarga ativada: sua próxima magia recebe 50% de poder adicional.'; }
+        else if(j.classe==='guardiao') { j.escudoClasseAte=agora+60000; descricao='🛡️ Barreira ativada: o próximo dano recebido será reduzido em 65%.'; }
+        else if(j.classe==='ladino') { j.criticoGarantidoAte=agora+60000; descricao='🗡️ Emboscada preparada: seu próximo ataque será crítico.'; }
+        await salvarRPG(); return `${descricao}\n⏳ Recarga: 90 segundos.`;
+    }
     if (acao === 'iniciar') {
         await salvarRPG();
         return `🧭 *SUA AVENTURA COMEÇOU!*\n\n${statusRPG(j)}\n\nUse !rpg explorar para iniciar sua jornada.`;
@@ -2894,9 +4367,9 @@ async function processarRPG(id, nome, args) {
         registrarProgressoMissoes(id, 'explorar', 1);
         j.missao.progresso = j.missao.tipo === 'explorar' ? j.missao.progresso + 1 : j.missao.progresso;
         const encontro = randomInt(1, 101);
-        if (encontro <= 65) {
+        if (encontro <= 70) {
             const base = aleatorio(RPG_INIMIGOS);
-            const escala = 1 + (j.nivel - 1) * 0.12;
+            const escala = 1 + (j.nivel - 1) * 0.15;
             j.inimigo = {
                 nome: base.nome,
                 hp: Math.round(base.hp * escala),
@@ -2910,14 +4383,14 @@ async function processarRPG(id, nome, args) {
                 turno: 0
             };
             msg = `🌲 Você explorou uma região desconhecida e encontrou *${j.inimigo.nome}*!\n❤️ Inimigo: ${j.inimigo.hp} HP\n\nUse !rpg atacar para lutar ou !rpg fugir para recuar.`;
-        } else if (encontro <= 85) {
-            const moedas = randomInt(12, 36);
-            const xp = randomInt(8, 19);
+        } else if (encontro <= 93) {
+            const moedas = randomInt(55, 151) + j.nivel * 5;
+            const xp = randomInt(35, 91) + j.nivel * 3;
             j.moedas += moedas;
             const subidas = await adicionarXPRPG(j, xp);
             msg = `🎒 Você encontrou um baú abandonado!\n🪙 +${moedas} moedas RPG\n✨ +${xp} XP${subidas.length ? '\n⭐ Subiu para o nível ' + subidas.join(', ') + '!' : ''}`;
         } else {
-            const cura = Math.min(j.hpMax - j.hp, 25);
+            const cura = Math.min(j.hpMax - j.hp, 40);
             j.hp += cura;
             msg = `🌿 Você encontrou uma fonte tranquila e recuperou ${cura} HP.`;
         }
@@ -2930,7 +4403,13 @@ async function processarRPG(id, nome, args) {
         const multiplicador = obterMultiplicadorMagiaRPG(j);
         const bonusCopia = j.poderCopiado && Date.now() < j.poderCopiado.ate
             ? Math.max(3, Math.round(j.poderCopiado.ataque * 0.55)) : 0;
-        const dano = Math.max(1, Math.round((j.ataque + randomInt(0, 7) + bonusCopia) * multiplicador) - j.inimigo.defesa);
+        const cargo = cargoPoliticoDoUsuario(grupoJid,id);
+        const bonusCargo = cargo==='prefeito' ? 1.10 : cargo==='vice' ? 1.06 : cargo==='vereador' ? 1.03 : 1;
+        const bonusClasse = j.classe==='guerreiro' ? 1.12 : 1;
+        const bonusHabilidade = Date.now()<(j.bonusProximoAtaqueAte||0) ? (Number(j.bonusProximoAtaque)||1) : 1;
+        const critico = Date.now()<(j.criticoGarantidoAte||0) || (j.classe==='ladino' && Math.random()<0.15);
+        const dano = Math.max(1, Math.round((j.ataque + randomInt(0, 7) + bonusCopia) * multiplicador * bonusCargo * bonusClasse * bonusHabilidade * (critico?1.7:1)) - j.inimigo.defesa);
+        j.bonusProximoAtaque=1; j.bonusProximoAtaqueAte=0; j.criticoGarantidoAte=0;
         j.inimigo.hp -= dano;
         let danoZumbi = 0;
         if (j.zumbi && j.zumbi.vida > 0 && j.inimigo.hp > 0) {
@@ -2953,7 +4432,11 @@ async function processarRPG(id, nome, args) {
         } else {
             j.inimigo.turno = (Number(j.inimigo.turno)||0)+1;
             const estilo = j.inimigo.estilo || 'agressivo';
-            let recebido = Math.max(1, j.inimigo.ataque + randomInt(0, 4) - j.defesa);
+            let recebido = Math.max(1, j.inimigo.ataque + randomInt(0, 4) - Math.round(j.defesa * (j.classe==='guardiao'?1.15:1)));
+            const reducaoCargo = cargo==='prefeito'?0.05:cargo==='vice'?0.10:cargo==='vereador'?0.03:0;
+            if (reducaoCargo) recebido=Math.ceil(recebido*(1-reducaoCargo));
+            if (Date.now()<(j.escudoClasseAte||0)) { recebido=Math.ceil(recebido*0.35); j.escudoClasseAte=0; }
+            if (Date.now()<(j.escudoPoliticoAte||0)) { recebido=Math.ceil(recebido*0.5); j.escudoPoliticoAte=0; }
             let formaAtaque = '💢 O inimigo executou um ataque direto.';
             if (estilo === 'agressivo' && j.inimigo.turno % 3 === 0) { recebido = Math.round(recebido * 1.65); formaAtaque = '💥 Investida brutal! O inimigo aumentou o dano.'; }
             else if (estilo === 'tatico' && j.inimigo.turno % 2 === 0) { recebido = Math.round(recebido * 1.2); formaAtaque = '🎯 Golpe calculado: o inimigo encontrou uma abertura.'; }
@@ -3033,9 +4516,9 @@ async function processarRPG(id, nome, args) {
             j.moedas += j.missao.recompensa;
             const subidas = await adicionarXPRPG(j, j.missao.xp);
             j.progresso.missoesConcluidas++;
-            j.missao = { tipo: 'explorar', meta: 3, progresso: 0, recompensa: 45, xp: 35 };
+            j.missao = { tipo: 'explorar', meta: 3, progresso: 0, recompensa: 120, xp: 90 };
             await salvarRPG();
-            return `🏅 Missão concluída!\n🪙 +45 moedas RPG\n✨ +35 XP${subidas.length ? '\n⭐ Nível: ' + j.nivel : ''}\nNova missão: explore 3 vezes.`;
+            return `🏅 Missão concluída!\n🪙 +120 moedas RPG\n✨ +90 XP${subidas.length ? '\n⭐ Nível: ' + j.nivel : ''}\nNova missão: explore 3 vezes.`;
         }
         await salvarRPG();
         return `📜 *MISSÃO ATUAL*\nExplore ${j.missao.meta} vezes.\nProgresso: ${j.missao.progresso}/${j.missao.meta}\nRecompensa: ${j.missao.recompensa} moedas RPG + ${j.missao.xp} XP.`;
@@ -3137,9 +4620,10 @@ async function processarMercado(id, nome, args) {
     }
     return 'Use !mercado, !mercado vender, !mercado comprar ou !mercado cancelar.';
 }
-async function processarGuilda(id,nome,args) {
+async function processarGuilda(id,nome,args,msg) {
     const acao=normalizar(args[0]||'status'); const nomeGuilda=args.slice(1).join(' ').trim();
-    const gid=sistemasV310.membrosGuilda[id]; const guilda=gid?sistemasV310.guildas[gid]:null;
+    const chaveMembro=encontrarChaveUsuario(sistemasV310.membrosGuilda,id);
+    const gid=chaveMembro?sistemasV310.membrosGuilda[chaveMembro]:null; const guilda=gid?sistemasV310.guildas[gid]:null;
     if (acao==='criar') {
         if (gid) return 'Você já pertence a uma guilda. Saia dela antes de criar outra.';
         if (nomeGuilda.length<3||nomeGuilda.length>24) return 'Nome de guilda: entre 3 e 24 caracteres. Use !guilda criar nome.';
@@ -3152,22 +4636,26 @@ async function processarGuilda(id,nome,args) {
         const g=sistemasV310.guildas[String(args[1]||'').toUpperCase()];
         if (!g) return 'Guilda não encontrada. Consulte !guildas.';
         if (gid) return 'Você já está em uma guilda.';
-        if (!g.convites?.[id]) return 'Você precisa receber um convite do líder para entrar.';
-        delete g.convites[id]; g.membros.push(id); sistemasV310.membrosGuilda[id]=g.id; await salvarSistemas310();
-        return `Bem-vindo à guilda *${g.nome}*!`;
+        g.convites ||= {};
+        const conviteKey=encontrarChaveUsuario(g.convites,id);
+        if (!conviteKey || Date.now()-Number(g.convites[conviteKey])>7*86400000) return 'Você precisa receber um convite válido do líder. Convites expiram em 7 dias.';
+        delete g.convites[conviteKey];
+        g.membros ||= [];
+        if (!g.membros.some(x=>mesmoUsuario(x,id))) g.membros.push(id);
+        sistemasV310.membrosGuilda[id]=g.id; await salvarSistemas310();
+        return `Bem-vindo à guilda *${g.nome}*! Convite confirmado.`;
     }
     if (acao==='convidar') {
-        if (!guilda || guilda.lider!==id) return 'Somente o líder pode convidar membros.';
-        const alvo=mencionarAlvo({message:{extendedTextMessage:{contextInfo:{mentionedJid:[]}}}},args,1);
-        const numero=String(args[1]||'').replace(/\D/g,''); const alvoFinal=alvo || (numero?`${numero}@s.whatsapp.net`:'');
-        if (!alvoFinal || mesmoUsuario(alvoFinal,id) || sistemasV310.membrosGuilda[alvoFinal]) return 'Informe alguém que ainda não esteja em uma guilda: !guilda convidar @pessoa.';
-        guilda.convites[alvoFinal]=Date.now(); await salvarSistemas310();
-        return `Convite enviado para ${nomeExibicao(alvoFinal)}. A pessoa deve usar !guilda entrar ${guilda.id}.`;
+        if (!guilda || !mesmoUsuario(guilda.lider,id)) return 'Somente o líder pode convidar membros.';
+        const alvo=mencionarAlvo(msg,args,1); const alvoFinal=alvo || (String(args[1]||'').replace(/\D/g,'')?`${String(args[1]).replace(/\D/g,'')}@s.whatsapp.net`:'');
+        if (!alvoFinal || mesmoUsuario(alvoFinal,id) || encontrarChaveUsuario(sistemasV310.membrosGuilda,alvoFinal)) return 'Informe alguém que ainda não esteja em uma guilda: !guilda convidar @pessoa.';
+        guilda.convites ||= {}; guilda.convites[alvoFinal]=Date.now(); await salvarSistemas310();
+        return `📨 Convite enviado para ${nomeExibicao(alvoFinal)}. A pessoa deve usar *!guilda entrar ${guilda.id}* em até 7 dias.`;
     }
     if (acao==='sair') {
         if (!guilda) return 'Você não está em uma guilda.';
-        if (guilda.lider===id && guilda.membros.length>1) return 'O líder precisa transferir a liderança antes de sair.';
-        guilda.membros=guilda.membros.filter(x=>!mesmoUsuario(x,id)); delete sistemasV310.membrosGuilda[id];
+        if (mesmoUsuario(guilda.lider,id) && guilda.membros.length>1) return 'O líder precisa transferir a liderança antes de sair.';
+        guilda.membros=guilda.membros.filter(x=>!mesmoUsuario(x,id)); delete sistemasV310.membrosGuilda[chaveMembro];
         if (!guilda.membros.length) delete sistemasV310.guildas[guilda.id];
         await salvarSistemas310(); return 'Você saiu da guilda.';
     }
@@ -3178,9 +4666,68 @@ async function processarGuilda(id,nome,args) {
         c.saldo-=valor; guilda.tesouro+=valor; await Promise.all([salvarWACoins(),salvarSistemas310()]);
         return `🏦 Você contribuiu com ${formatarWACoins(valor)}. Tesouro da guilda: ${formatarWACoins(guilda.tesouro)}.`;
     }
-    if (acao==='status' || acao==='ver') return guilda?`🏰 *${guilda.nome}*\nID: ${guilda.id}\nLíder: ${nomeExibicao(guilda.lider)}\nMembros: ${guilda.membros.length}\nTesouro: ${formatarWACoins(guilda.tesouro)}\n\n!guilda convidar @pessoa | !guilda doar valor | !guilda sair`:'Você não está em uma guilda. Use !guildas ou !guilda criar nome.';
+    if (acao==='status' || acao==='ver') return guilda?`🏰 *${guilda.nome}*\nID: ${guilda.id}\nLíder: ${nomeExibicao(guilda.lider)}\nMembros: ${guilda.membros.length}\nConvites pendentes: ${Object.keys(guilda.convites||{}).length}\nTesouro: ${formatarWACoins(guilda.tesouro)}\n\n!guilda convidar @pessoa | !guilda doar valor | !guilda sair`:'Você não está em uma guilda. Use !guildas ou !guilda criar nome.';
     return 'Comandos: !guilda criar nome | !guilda convidar @pessoa | !guilda entrar ID | !guilda sair | !guilda doar valor | !guilda.';
 }
+
+async function processarTripulacao(id,nome,args,msg) {
+    const acao=normalizar(args[0]||'status');
+    sistemasV310.tripulacoes ||= {}; sistemasV310.membrosTripulacao ||= {};
+    const chaveMembro=encontrarChaveUsuario(sistemasV310.membrosTripulacao,id);
+    const tripId=chaveMembro?sistemasV310.membrosTripulacao[chaveMembro]:null;
+    const trip=tripId?sistemasV310.tripulacoes[tripId]:null;
+    if (acao==='criar') {
+        const titulo=args.slice(1).join(' ').trim();
+        if (trip) return 'Você já pertence a uma tripulação.';
+        if (titulo.length<3||titulo.length>28) return 'Use !tripulacao criar NOME (3 a 28 caracteres).';
+        const novoId=`T${Date.now().toString(36).toUpperCase()}`;
+        sistemasV310.tripulacoes[novoId]={id:novoId,nome:titulo,lider:id,membros:[id],convites:{},pontos:0,capturas:0,criadaEm:Date.now()};
+        sistemasV310.membrosTripulacao[id]=novoId; await salvarSistemas310();
+        return `🚢 *TRIPULAÇÃO ${titulo} CRIADA!*\nID: ${novoId}\nConvide até 7 pessoas com !tripulacao convidar @pessoa.`;
+    }
+    if (acao==='entrar' || acao==='aceitar') {
+        const alvoTrip=sistemasV310.tripulacoes[String(args[1]||'').toUpperCase()];
+        if (!alvoTrip) return 'Tripulação não encontrada. Use !tripulacao ranking.';
+        if (trip) return 'Você já pertence a uma tripulação. Saia antes de entrar em outra.';
+        const convite=encontrarChaveUsuario(alvoTrip.convites||{},id);
+        if (!convite || Date.now()-Number(alvoTrip.convites[convite])>7*86400000) return 'Você precisa de um convite válido do capitão. Convites expiram em 7 dias.';
+        delete alvoTrip.convites[convite];
+        if (alvoTrip.membros.length>=8) return 'Essa tripulação já atingiu o limite de 8 integrantes.';
+        if (!alvoTrip.membros.some(x=>mesmoUsuario(x,id))) alvoTrip.membros.push(id);
+        sistemasV310.membrosTripulacao[id]=alvoTrip.id; await salvarSistemas310();
+        return `⚓ Você entrou na tripulação *${alvoTrip.nome}*!`;
+    }
+    if (acao==='convidar') {
+        if (!trip || !mesmoUsuario(trip.lider,id)) return 'Somente o capitão pode convidar integrantes.';
+        const alvo=mencionarAlvo(msg,args,1); const alvoFinal=alvo || (String(args[1]||'').replace(/\D/g,'')?`${String(args[1]).replace(/\D/g,'')}@s.whatsapp.net`:'');
+        if (!alvoFinal || mesmoUsuario(alvoFinal,id) || encontrarChaveUsuario(sistemasV310.membrosTripulacao,alvoFinal)) return 'Mencione alguém que ainda não esteja em uma tripulação.';
+        if (trip.membros.length>=8) return 'Tripulação cheia: limite de 8 integrantes.';
+        trip.convites ||= {}; trip.convites[alvoFinal]=Date.now(); await salvarSistemas310();
+        return `📨 Convite enviado para ${nomeExibicao(alvoFinal)}. Use !tripulacao entrar ${trip.id} em até 7 dias.`;
+    }
+    if (acao==='transferir' || acao==='lider') {
+        if (!trip || !mesmoUsuario(trip.lider,id)) return 'Somente o capitão atual pode transferir a liderança.';
+        const alvo=mencionarAlvo(msg,args,1);
+        if (!alvo || !trip.membros.some(x=>mesmoUsuario(x,alvo))) return 'Mencione alguém que já esteja na tripulação: !tripulacao transferir @pessoa.';
+        trip.lider=trip.membros.find(x=>mesmoUsuario(x,alvo)) || alvo;
+        await salvarSistemas310();
+        return `👑 Liderança da tripulação *${trip.nome}* transferida para ${nomeExibicao(trip.lider)}.`;
+    }
+    if (acao==='sair') {
+        if (!trip) return 'Você não está em uma tripulação.';
+        if (mesmoUsuario(trip.lider,id) && trip.membros.length>1) return 'O capitão deve transferir a liderança antes de sair.';
+        trip.membros=trip.membros.filter(x=>!mesmoUsuario(x,id)); delete sistemasV310.membrosTripulacao[chaveMembro];
+        if (!trip.membros.length) delete sistemasV310.tripulacoes[trip.id];
+        await salvarSistemas310(); return 'Você saiu da tripulação.';
+    }
+    if (acao==='ranking') {
+        const lista=Object.values(sistemasV310.tripulacoes).sort((a,b)=>(b.pontos||0)-(a.pontos||0)).slice(0,10);
+        return `🚢 *RANKING DE TRIPULAÇÕES*\n\n${lista.length?lista.map((t,i)=>`${i+1}. *${t.nome}* — ${Number(t.pontos||0).toLocaleString('pt-BR')} pontos | ${t.membros.length}/8 membros`).join('\n'):'Nenhuma tripulação criada.'}`;
+    }
+    if (acao==='status' || acao==='ver') return trip?`🚢 *${trip.nome}*\nID: ${trip.id}\nCapitão: ${nomeExibicao(trip.lider)}\nIntegrantes: ${trip.membros.map(x=>nomeExibicao(x)).join(', ')}\n🐟 Capturas da tripulação: ${trip.capturas||0}\n🏆 Pontos: ${(trip.pontos||0).toLocaleString('pt-BR')}\nConvites pendentes: ${Object.keys(trip.convites||{}).length}`:'Você não pertence a uma tripulação. Use !tripulacao criar NOME.';
+    return '🚢 *TRIPULAÇÕES*\n!tripulacao criar NOME\n!tripulacao convidar @pessoa\n!tripulacao entrar ID\n!tripulacao status\n!tripulacao ranking\n!tripulacao transferir @pessoa\n!tripulacao sair\n\nCada tripulação aceita até 8 integrantes. Capturas de pesca aumentam a pontuação coletiva.';
+}
+
 function listarGuildas() {
     const lista=Object.values(sistemasV310.guildas).sort((a,b)=>b.membros.length-a.membros.length).slice(0,15);
     return `🏰 *GUILDAS*\n\n${lista.length?lista.map(g=>`• *${g.nome}* — ${g.id} — ${g.membros.length} membro(s)`).join('\n'):'Nenhuma guilda criada.'}\n\nPara entrar, receba convite e use !guilda entrar ID.`;
@@ -3203,43 +4750,93 @@ async function resgatarMissao(id,nome,tipo) {
     const completa=Object.entries(meta).every(([k,v])=>p[k]>=v); const flag=diaria?'diariasResgatadas':'semanaisResgatadas';
     if (r[flag]) return 'Você já resgatou essa missão neste período.';
     if (!completa) return `Ainda não concluiu todas as tarefas.\n\n${mostrarMissoes(id)}`;
-    r[flag]=true; const premio=diaria?250:1200; await adicionarWACoins(id,nome,premio); await salvarSistemas310();
+    r[flag]=true; const premio=diaria?450:2200; await adicionarWACoins(id,nome,premio); await salvarSistemas310();
     return `🏅 Missões ${tipo==='diaria'?'diárias':'semanais'} concluídas! Você recebeu ${formatarWACoins(premio)}.`;
 }
 async function processarChefe(sock,jid,id,nome,args) {
     const acao=normalizar(args[0]||'status'); let chefe=sistemasV310.chefes[jid];
     if (acao==='iniciar') {
         if (chefe && chefe.hp>0) return 'Já existe um Chefe Mundial ativo nesta conversa.';
-        chefe={nome:aleatorio(['Colosso das Cinzas','Dragão do Vazio','Titã Abissal']),hp:12000,hpMax:12000,ataque:45,defesa:12,iniciadoEm:Date.now(),contribuicoes:{},ultimaAcao:0};
+        const modelos = [
+            { nome:'Colosso das Cinzas', hp:100000, ataque:28, defesa:8, recompensa:1 },
+            { nome:'Dragão do Vazio', hp:150000, ataque:38, defesa:12, recompensa:1.35 },
+            { nome:'Titã Abissal', hp:250000, ataque:50, defesa:16, recompensa:1.8 }
+        ];
+        const pedido=normalizar(args[1]||'');
+        const indice=pedido==='2'||pedido==='medio'||pedido==='150k'?1:pedido==='3'||pedido==='dificil'||pedido==='250k'?2:0;
+        const modelo=modelos[indice];
+        chefe={...modelo,hpMax:modelo.hp,iniciadoEm:Date.now(),contribuicoes:{},ultimaAcao:0,fase:1,derrotadoEm:0};
         sistemasV310.chefes[jid]=chefe; await salvarSistemas310();
-        return `🌋 *CHEFE MUNDIAL: ${chefe.nome.toUpperCase()}*\n❤️ ${chefe.hp}/${chefe.hpMax} HP\n\nTodos podem participar com !chefemundial atacar. Use !chefemundial status para ver o progresso.`;
+        return `🌋 *CHEFE MUNDIAL: ${chefe.nome.toUpperCase()}*
+❤️ ${chefe.hp.toLocaleString('pt-BR')}/${chefe.hpMax.toLocaleString('pt-BR')} HP
+⚔️ Ataque: ${chefe.ataque} | Defesa: ${chefe.defesa}
+
+Todos podem participar com !chefemundial atacar ou !chefemundial conjurar NOME.
+Dificuldades: !chefemundial iniciar 1 (100 mil HP), 2 (150 mil HP) ou 3 (250 mil HP).`;
     }
-    if (!chefe || chefe.hp<=0) return 'Não há Chefe Mundial ativo. Um administrador ou jogador pode iniciar com !chefemundial iniciar.';
-    if (acao==='status') return `🌋 *${chefe.nome}*\n❤️ HP: ${chefe.hp}/${chefe.hpMax}\n⚔️ Participantes: ${Object.keys(chefe.contribuicoes).length}\n🏆 Maior dano: ${Object.entries(chefe.contribuicoes).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([u,d],i)=>`${i+1}. ${nomeExibicao(u)} — ${d}`).join('\n')||'Ainda ninguém.'}`;
+    if (!chefe || chefe.hp<=0) return 'Não há Chefe Mundial ativo. Inicie com !chefemundial iniciar [1|2|3].';
+    if (acao==='status') {
+        const fase=chefe.hp<=chefe.hpMax*.15?3:chefe.hp<=chefe.hpMax*.4?2:1;
+        return `🌋 *${chefe.nome}*
+❤️ HP: ${chefe.hp.toLocaleString('pt-BR')}/${chefe.hpMax.toLocaleString('pt-BR')}
+🔥 Fase: ${fase}/3
+⚔️ Participantes: ${Object.keys(chefe.contribuicoes).length}
+🏆 Maior dano:
+${Object.entries(chefe.contribuicoes).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([u,d],i)=>`${i+1}. ${nomeExibicao(u)} — ${d.toLocaleString('pt-BR')}`).join('\n')||'Ainda ninguém.'}`;
+    }
     if (acao==='atacar' || acao==='conjurar') {
         const j=obterJogadorRPG(id,nome); if (j.hp<=0) return 'Seu personagem está sem vida. Use !rpg descansar.';
-        let dano=Math.max(1,j.ataque+randomInt(0,12)-chefe.defesa); let extra='';
+        let dano=Math.max(1,Math.round(j.ataque*2.5+randomInt(0,25)+j.nivel*2-chefe.defesa*.25)); let extra='';
         if (acao==='conjurar') {
             const chave=normalizar(args.slice(1).join('_')).replace(/\s+/g,'_'); const magia=RPG_MAGIAS[chave];
             if (!magia || !j.magias.includes(chave)) return 'Magia inválida ou não desbloqueada. Use !rpg magias.';
-            if (chave==='agua') { const cura=Math.min(25,j.hpMax-j.hp); j.hp+=cura; dano=Math.max(1,Math.floor(dano*.5)); extra=`\n💧 Recuperou ${cura} HP.`; }
-            else if (chave==='plantificar') dano=Math.round(dano*1.4);
-            else if (chave==='bola_de_fogo') dano=Math.round((j.ataque*2.4+18)*obterMultiplicadorMagiaRPG(j));
-            else dano=Math.round(dano*1.25);
+            if (chave==='agua') { const cura=Math.min(40,j.hpMax-j.hp); j.hp+=cura; dano=Math.max(1,Math.floor(dano*.5)); extra=`\n💧 Recuperou ${cura} HP.`; }
+            else if (chave==='plantificar') dano=Math.round(dano*1.6);
+            else if (chave==='bola_de_fogo') dano=Math.round((j.ataque*4.5+75+j.nivel*3)*obterMultiplicadorMagiaRPG(j));
+            else dano=Math.round(dano*1.4);
             registrarProgressoMissoes(id,'conjurar',1);
         }
+        const faseAntes=chefe.hp<=chefe.hpMax*.15?3:chefe.hp<=chefe.hpMax*.4?2:1;
         dano=Math.max(1,dano); chefe.hp=Math.max(0,chefe.hp-dano); chefe.contribuicoes[id]=(chefe.contribuicoes[id]||0)+dano;
-        let resultado=`⚔️ ${nome} causou ${dano} de dano a ${chefe.nome}.${extra}\n❤️ Chefe: ${chefe.hp}/${chefe.hpMax} HP`;
-        if (chefe.hp===0) {
+        const faseDepois=chefe.hp<=chefe.hpMax*.15?3:chefe.hp<=chefe.hpMax*.4?2:1;
+        const avisoFase=faseDepois>faseAntes?`\n🔥 *${faseDepois===2?'FASE 2: FÚRIA ABISSAL!':'FASE 3: DESESPERO FINAL!'}* O chefe ficou mais perigoso.`:'';
+        let danoRecebido=0;
+        if (chefe.hp>0) {
+            const multiplicadorFase=faseDepois===3?1.65:faseDepois===2?1.3:1;
+            const defesaEfetiva=j.defesa*(j.classe==='guardiao'?1.15:1);
+            danoRecebido=Math.max(1,Math.round(chefe.ataque*multiplicadorFase-defesaEfetiva));
+            j.hp=Math.max(0,j.hp-danoRecebido);
+            if (j.hp<=0) j.hp=Math.max(1,Math.floor(j.hpMax*.35));
+        }
+        let resultado=`⚔️ ${nome} causou ${dano.toLocaleString('pt-BR')} de dano a ${chefe.nome}.${extra}\n❤️ Chefe: ${chefe.hp.toLocaleString('pt-BR')}/${chefe.hpMax.toLocaleString('pt-BR')} HP${avisoFase}${danoRecebido?`\n💥 Contra-ataque do chefe: -${danoRecebido} HP (sua vida: ${j.hp}/${j.hpMax}).`:''}`;
+        if (chefe.hp===0 && !chefe.recompensasEntregues) {
             const ranking=Object.entries(chefe.contribuicoes).sort((a,b)=>b[1]-a[1]);
-            for (const [uid, danoTotal] of ranking) { const premio=150+Math.floor(danoTotal/25); await adicionarWACoins(uid,nomeExibicao(uid),premio); const j2=obterJogadorRPG(uid,nomeExibicao(uid)); j2.moedas+=Math.floor(premio/2); await salvarRPG(); }
-            resultado+=`\n\n🏆 *CHEFE DERROTADO!*\n${ranking.slice(0,5).map(([u,d],i)=>`${i+1}. ${nomeExibicao(u)} — ${d} dano`).join('\n')}\nRecompensas foram enviadas aos participantes.`;
-            chefe.derrotadoEm=Date.now(); chefe.hp=0;
+            const fator=Number(chefe.recompensa)||1;
+            for (const [uid,danoTotal] of ranking) {
+                const premioW=Math.round((1800+Math.min(18000,Math.floor(danoTotal*.16)))*fator);
+                const premioR=Math.round((2600+Math.min(26000,Math.floor(danoTotal*.2)))*fator);
+                await adicionarWACoins(uid,nomeExibicao(uid),premioW);
+                const j2=obterJogadorRPG(uid,nomeExibicao(uid));
+                j2.moedas+=premioR;
+                const xp=Math.round((2200+Math.min(30000,Math.floor(danoTotal*.12)))*fator);
+                const subidas=await adicionarXPRPG(j2,xp);
+                if (randomInt(1,101)<=12) j2.inventario.pocao_grande=(Number(j2.inventario.pocao_grande)||0)+1;
+                if (randomInt(1,101)<=3) j2.inventario.liberador=(Number(j2.inventario.liberador)||0)+1;
+                if (subidas.length) j2.ultimaRecompensaBossNiveis=subidas;
+            }
+            const bonusColocacao=[8000,5000,2500];
+            for (let i=0;i<Math.min(3,ranking.length);i++) {
+                const uid=ranking[i][0]; const j2=obterJogadorRPG(uid,nomeExibicao(uid)); j2.moedas+=bonusColocacao[i];
+                await adicionarWACoins(uid,nomeExibicao(uid),bonusColocacao[i]);
+            }
+            resultado+=`\n\n🏆 *CHEFE DERROTADO!*\n${ranking.slice(0,8).map(([u,d],i)=>`${i+1}. ${nomeExibicao(u)} — ${d.toLocaleString('pt-BR')} dano`).join('\n')}\n\n🎁 Recompensas por participação: WACoins, moedas RPG e XP proporcionais ao dano.\n🥇 Bônus de colocação: 8.000 / 5.000 / 2.500 moedas RPG e WACoins.\n🧪 Chance de poção grande: 12% | Liberador: 3%.`;
+            chefe.derrotadoEm=Date.now(); chefe.hp=0; chefe.recompensasEntregues=true;
         }
         await Promise.all([salvarSistemas310(),salvarRPG(),salvarWACoins()]); return resultado;
     }
-    return 'Use !chefemundial iniciar | status | atacar | conjurar NOME.';
+    return 'Use !chefemundial iniciar [1|2|3] | status | atacar | conjurar NOME.';
 }
+
 async function processarPVP(sock,jid,id,nome,args,msg) {
     const acao=normalizar(args[0]||''); let duelo=sistemasV310.desafiosPVP[jid];
     if (acao==='aceitar') {
@@ -3675,14 +5272,14 @@ async function processarComando(sock, msg) {
     const conteudo = extrairTexto(msg.message).trim();
 
     // Durante manutenção, apenas os números configurados em NUMEROS_ADM controlam o bot.
-    if (conteudo.startsWith(PREFIXO)) {
-        const comandoManutencao = conteudo.split(/\s+/)[0].toLowerCase();
+    if (mensagemTemPrefixo(conteudo)) {
+        const comandoManutencao = interpretarComando(conteudo).comando;
         if (comandoManutencao === '!manutencao') {
             if (!await remetenteEhAdminBot(sock, msg)) {
                 await texto(sock, jid, '⛔ Apenas os administradores configurados no código podem ativar ou encerrar a manutenção.');
                 return;
             }
-            const acao = conteudo.split(/\s+/)[1]?.toLowerCase();
+            const acao = interpretarComando(conteudo).args[0]?.toLowerCase();
             manutencaoAtiva = acao === 'on' ? true : acao === 'off' ? false : !manutencaoAtiva;
             carteirasWACoins.__manutencao_ativa = manutencaoAtiva;
             await salvarWACoins();
@@ -3695,16 +5292,16 @@ async function processarComando(sock, msg) {
         }
     }
 
-    if (manutencaoAtiva && conteudo.startsWith(PREFIXO) && !await remetenteEhAdminBot(sock, msg)) {
+    if (manutencaoAtiva && mensagemTemPrefixo(conteudo) && !await remetenteEhAdminBot(sock, msg)) {
         await enviarAvisoManutencao(sock, jid, '🛠️ O WABOT está em manutenção. Tente novamente mais tarde.');
         return;
     }
 
     // Com o bot desligado, mensagens comuns não avançam entrevistas nem executam ações.
-    if (!botAtivo && !conteudo.startsWith(PREFIXO)) return;
+    if (!botAtivo && !mensagemTemPrefixo(conteudo)) return;
 
     // Respostas livres dentro de uma sala de entrevista são processadas antes dos comandos.
-    if (jid.endsWith('@g.us') && entrevistasAtivas.has(jid) && !conteudo.startsWith(PREFIXO)) {
+    if (jid.endsWith('@g.us') && entrevistasAtivas.has(jid) && !mensagemTemPrefixo(conteudo)) {
         await processarRespostaEntrevista(sock, msg, conteudo);
         return;
     }
@@ -3734,11 +5331,11 @@ async function processarComando(sock, msg) {
         return;
     }
 
-    if (!conteudo.startsWith(PREFIXO)) return;
+    if (!mensagemTemPrefixo(conteudo)) return;
 
-    const partes = conteudo.split(/\s+/);
-    const comando = partes[0].toLowerCase();
-    const args = partes.slice(1);
+    const interpretado = interpretarComando(conteudo);
+    const comando = interpretado.comando;
+    const args = interpretado.args;
 
     if (comando === '!boton' || comando === '!botoff') {
         if (!await remetenteEhAdminBot(sock, msg)) {
@@ -3772,17 +5369,59 @@ async function processarComando(sock, msg) {
     let resposta = '';
     let registrar = true;
 
-    console.log(`[WABOT] ${comando} - ${nomeResolvido}`);
+    console.log(`[WABOT] ${comando}${interpretado.corrigido ? ` (corrigido de ${interpretado.original})` : ''} - ${nomeResolvido}`);
 
     switch (comando) {
 
+        case '!erros': {
+            if (!await remetenteEhAdminBot(sock, msg)) { resposta = '⛔ Apenas administradores configurados podem consultar os erros internos.'; break; }
+            const limite = Math.min(10, Math.max(1, Number(args[0]) || 10));
+            const recentes = historicoErrosBot.slice(-limite).reverse();
+            resposta = recentes.length
+                ? `🧰 *DIAGNÓSTICO DO WABOT — ${recentes.length} ERRO(S)*\n\n${recentes.map(e => `#${e.numero} • Código ${e.codigo} — ${CATALOGO_ERROS_WABOT[e.codigo]?.titulo || 'ERRO'}\n${new Date(e.horario).toLocaleString('pt-BR')}\n${e.erro.slice(0, 500)}`).join('\n\n')}\n\nUse !codigo NÚMERO para detalhes ou !codigos para ver o catálogo.`
+                : '✅ Nenhum erro registrado desde a última inicialização do bot. Use !codigos para consultar o catálogo.';
+            break;
+        }
+
+        case '!codigos': {
+            const linhas = Object.entries(CATALOGO_ERROS_WABOT).map(([codigo, item]) => `*${codigo} — ${item.titulo}*\n${item.descricao}`).join('\n\n');
+            resposta = `🧰 *CATÁLOGO DE ERROS — WABOT V${VERSAO}*\n\n${linhas}\n\nUse *!codigo 202* para consultar os detalhes de um código.\n_Nota: o catálogo descreve categorias possíveis; não significa que todos esses erros já ocorreram._`;
+            break;
+        }
+
+        case '!codigo': {
+            const numeroCodigo = String(args[0] || '').trim();
+            const item = CATALOGO_ERROS_WABOT[numeroCodigo];
+            if (!item) {
+                resposta = 'Código inválido ou inexistente. Use !codigos para ver a lista.';
+                break;
+            }
+            const ocorrencias = historicoErrosBot.filter(e => e.codigo === Number(numeroCodigo)).length;
+            resposta = `🧾 *CÓDIGO ${numeroCodigo} — ${item.titulo}*\n\n*Descrição:* ${item.descricao}\n*Possíveis causas:* ${item.causa}\n*Ação recomendada:* ${item.acao}\n\n*Ocorrências nesta sessão:* ${ocorrencias}`;
+            break;
+        }
+
+        case '!buscarcodigo': {
+            const codigo = String(args[0] || '').toUpperCase().trim();
+            if (!/^WB-\d{8}-[A-Z0-9]{5}$/.test(codigo)) { resposta = 'Formato inválido. Envie: !buscarcodigo WB-AAAAMMDD-XXXXX'; break; }
+            const registro = historicoCodigosMensagem.get(codigo);
+            if (!registro || registro.jid !== jid) { resposta = 'Não encontrei esse código nesta conversa. O histórico é temporário e fica disponível enquanto o bot está ligado.'; break; }
+            resposta = `🔎 *MENSAGEM ENCONTRADA*\nCódigo: ${codigo}\nEnviada em: ${new Date(registro.criadoEm).toLocaleString('pt-BR')}\n\n${registro.conteudo || '(Mensagem sem texto; pode conter apenas mídia.)'}`;
+            break;
+        }
+
         case '!upd': {
-            resposta = `🆕 *ATUALIZAÇÕES RECENTES DO WABOT*\n\n*V3.1.7 — Correções e melhorias*\n• Correção na exibição de nomes: prioriza nomes do WhatsApp e do grupo em vez de identificadores numéricos.\n• Melhor compatibilidade de fontes em imagens, com fallback para caracteres acentuados e emojis.\n• Ajustes de renderização e qualidade de imagens PNG.\n• Novo comando !upd para consultar as novidades.\n\n*V3.1.6 — Desempenho e estabilidade*\n• Filas de mensagens organizadas por conversa.\n• Processamento simultâneo limitado entre conversas.\n• Proteção contra mensagens duplicadas e filas excessivas.\n• Gravações JSON serializadas para reduzir conflitos.\n• Cache temporário de imagens limitado.\n• Reconexão progressiva e logs de diagnóstico.\n\n*V3.1.5 — Novos sistemas*\n• Árvore de habilidades do RPG.\n• Agendamento de resets de RPG e pesca.\n• Roleta com imagem de resultado.\n• Sistema de renascimento da pesca com bônus permanentes.`;
+            resposta = `🆕 *ATUALIZAÇÕES RECENTES DO WABOT*\n\n*V3.3.0 — Desempenho e estabilidade*\n• Histórico de mensagens salvo em lote, sem travar cada resposta esperando a gravação do JSON.\n• Histórico limitado a 250 mensagens por conversa e 300 conversas, evitando crescimento indefinido do arquivo.\n• Mensagens comuns que não acionam sistemas do bot deixam de ocupar as filas de comandos.\n• Diagnóstico de saúde agora informa tamanho das filas, conversas pendentes e histórico.\n• Salvamento agrupado com nova tentativa automática em caso de falha.\n\n*V3.2.9 — WABOT Poker*\n• Novo jogo individual de Poker contra o bot, com três níveis de dificuldade.\n• Mãos de cinco cartas, troca estratégica, avaliação das nove combinações clássicas e resultado ilustrado.\n• Mesa visual em PNG gerada com Sharp; cartas do bot ficam ocultas até o resultado.\n• Estatísticas de vitórias, derrotas, empates e partidas salvas em dados-sistemas-v310.json.\n• Sem apostas, WACoins ou dinheiro real.\n\n*V3.2.8 — Economia, profissões e cidades*\n• Fazendas compráveis, plantações temporizadas, colheita, estoque e venda de recursos.\n• Quatro profissões com requisitos de nível, salários, XP e produção de materiais.\n• Fundação de cidades globais, moradores, contribuições, reputação e ranking.\n• Construção de fazenda comunitária, serraria, pedreira, mercado e muralha com tesouro e materiais.\n\n*V3.2.7 — Catálogo de códigos de erro*\n• Novo !codigos lista as categorias internas de erro.\n• Novo !codigo NÚMERO explica descrição, causas possíveis e ação recomendada.\n• !erros agora associa cada ocorrência a um código de categoria, além do número sequencial.\n\n*V3.2.6 — Acessos extras e diagnóstico*\n• !masmorra comprar adquire +3 entradas diárias por 750 WACoins (um pacote por dia).\n• !erros [quantidade] lista erros recentes numerados; acesso restrito aos administradores.\n• !buscarcodigo WB-AAAAMMDD-XXXXX localiza mensagens do bot na conversa atual. Histórico temporário e limitado.\n\n*V3.2.5 — Expansão do RPG*\n• Nova masmorra persistente Fenda do Crepúsculo com cinco andares, inimigos escaláveis e chefe final.\n• Três expedições diárias, combate por turnos, poções, fuga e progresso salvo no perfil RPG.\n• Novos materiais: Fragmento Arcano e Núcleo Abissal.\n• Nova Forja: Poção grande, Espada rúnica (+20 ataque) e Escudo de cristal (+16 defesa).\n• Recompensas em XP e moedas RPG; materiais já obtidos são mantidos mesmo se o aventureiro for derrotado.\n\n*V3.2.4 — Edição de Natal*\n• Mensagens de texto e legendas recebem identificação individual WB-AAAAMMDD-XXXXX para facilitar suporte e rastreamento.\n• Identidade natalina automática nas mensagens até 02/01/2027.\n• Moldura natalina em imagens SVG geradas pelo bot, sem alterar os dados dos rankings.\n• Novo comando !presente: resgate diário ilustrado com WACoins e chance de bônus surpresa.\n• Novo Correio do Polo Norte com controle de resgate salvo em dados-wacoins.json.\n\n*V3.2.3 — RPG, pesca e sistemas sociais*\n• Chefes mundiais de 100.000, 150.000 e 250.000 HP, com recompensas muito maiores de XP, moedas RPG e WACoins.\n• Cinco novos inimigos, exploração com recompensas ampliadas e missões mais valiosas.\n• Guildas corrigidas: convites aceitam identificadores alternativos do WhatsApp e expiram em 7 dias.\n• Novo sistema de tripulações com até 8 pessoas, convites, capitão, pontuação coletiva e ranking por capturas.\n• Temporadas de pesca reiniciam automaticamente todo mês, com backup e preservação dos renascimentos e bônus permanentes.\n• Eventos temáticos automáticos com peixes exclusivos: Natal, Ano Novo, Carnaval, Páscoa, Festa Junina, Primavera e Halloween. Natal 2026 ativo até 02/01/2027.\n• Política: limite de 2 mandatos eleitos por pessoa; bloqueio de terceira eleição e registro persistente no JSON.\n\n*V3.2.2 — Eleição global e correção de subcomandos*
+• !politica ranking e demais subcomandos preservam os argumentos após o comando principal.
+• Eleição, partidos, candidaturas, votos, propostas e mandato são compartilhados entre todos os grupos.
+• Dados políticos são persistidos em sistemas JSON e migram automaticamente dos registros antigos por grupo.
+
+*V3.2.1 — Correção dos subcomandos políticos*\n• !politica ranking agora gera corretamente a imagem de classificação eleitoral.\n• !politica status, !politica partidos, !politica partido e !politica eleicao executam suas ações sem perder os argumentos.\n\n*V3.2.0 — Interpretação inteligente de comandos*\n• Correção automática de pequenos erros de digitação em comandos conhecidos.\n• Espaços extras depois do prefixo e entre argumentos são tratados corretamente.\n• Normalização de acentos e diferenças entre maiúsculas/minúsculas.\n• Sugestão de comando quando não há correspondência segura.\n\n*V3.1.9 — RPG expandido e política por grupo*\n• Quatro classes RPG: Guerreiro, Mago, Guardião e Ladino, com passivas e habilidades próprias.\n• Habilidades especiais com recarga e efeitos temporários em combate.\n• Sistema político compartilhado entre grupos, com partidos, candidaturas e votação para prefeito, vice e vereador.\n• Mandatos de sete dias e poderes exclusivos para os cargos.\n• Propostas públicas com votação dos membros.\n\n*V3.1.8 — Mares e renascimento da pesca*\n• Seis mares com peixes exclusivos e valores diferentes.\n• Acesso aos mares condicionado ao número de renascimentos.\n• Requisitos progressivos de capturas, peixes no inventário e WACoins.\n• Renascimento com confirmação em duas etapas.\n• Renascimento zera saldo e banco de WACoins, peixes, capturas e equipamentos.\n• Cada renascimento aumenta permanentemente sorte e peso.\n\n*V3.1.7 — Correções e melhorias*\n• Correção na exibição de nomes: prioriza nomes do WhatsApp e do grupo em vez de identificadores numéricos.\n• Melhor compatibilidade de fontes em imagens, com fallback para caracteres acentuados e emojis.\n• Ajustes de renderização e qualidade de imagens PNG.\n• Novo comando !upd para consultar as novidades.\n\n*V3.1.6 — Desempenho e estabilidade*\n• Filas de mensagens organizadas por conversa.\n• Processamento simultâneo limitado entre conversas.\n• Proteção contra mensagens duplicadas e filas excessivas.\n• Gravações JSON serializadas para reduzir conflitos.\n• Cache temporário de imagens limitado.\n• Reconexão progressiva e logs de diagnóstico.\n\n*V3.1.5 — Novos sistemas*\n• Árvore de habilidades do RPG.\n• Agendamento de resets de RPG e pesca.\n• Roleta com imagem de resultado.\n• Sistema de renascimento da pesca com bônus permanentes.`;
             break;
         }
 
         case '!helprpg': {
-            resposta = `🧭 *GUIA DO RPG WABOT*\n\nO RPG é independente da pesca e dos WACoins. Possui níveis, XP, vida, combate, equipamentos e magias.\n\n!rpg iniciar — criar personagem\n!rpg — ver status\n!rpg explorar — explorar\n!rpg atacar — atacar inimigo\n!rpg fugir — fugir\n!rpg curar — usar poção\n!rpg descansar — recuperar vida\n!rpg loja — loja\n!rpg comprar ID — comprar item\n!rpg inventario — inventário\n!rpg equipar ID — equipar item\n!rpg missao — missão\n!rpg arvore — imagem da árvore de evolução\n!rpg evoluir ataque/defesa/vida/magia — gastar ponto\n!rpg magias — ver magias e chances\n!rpg usar_liberador — roleta de poderes\n!rpg conjurar NOME — conjurar poder desbloqueado\n!chefemundial iniciar/status/atacar/conjurar NOME — chefe compartilhado\n!pvp @pessoa — duelo com magias\n!missoes — tarefas diárias e semanais\n\nO Liberador de poder é comprado na loja do RPG. Cada uso sorteia uma magia ainda não desbloqueada; poderes mais raros têm chances menores.\n⭐ Nível: +15 HP máximo, +2 ataque, +1 defesa e 1 ponto de evolução.\n🌳 Evolução: !rpg arvore | !rpg evoluir ataque/defesa/vida/magia.\n🪙 Moedas RPG são separadas dos WACoins.`;
+            resposta = `🧭 *GUIA DO RPG WABOT*\n\nO RPG é independente da pesca e dos WACoins. Possui níveis, XP, vida, combate, equipamentos, magias, classes e habilidades especiais.\n\n!rpg iniciar — criar personagem\n!rpg — ver status\n!rpg explorar — explorar\n!rpg atacar — atacar inimigo\n!rpg fugir — fugir\n!rpg curar — usar poção\n!rpg descansar — recuperar vida\n!rpg loja — loja\n!rpg comprar ID — comprar item\n!rpg inventario — inventário\n!rpg equipar ID — equipar item\n!rpg missao — missão\n!rpg arvore — imagem da árvore de evolução\n!rpg evoluir ataque/defesa/vida/magia — gastar ponto\n!rpg classe — escolher uma classe\n!rpg habilidade — ativar habilidade de classe\n!masmorra ajuda — Fenda do Crepúsculo (5 andares)\n!masmorra comprar — +3 acessos por 750 WACoins (1 pacote/dia)\n!forjar lista — receitas de equipamentos e poções\n!rpg fazenda — consultar fazenda e recursos\n!rpg fazenda comprar — comprar terreno\n!rpg plantar trigo|ervas|madeira — iniciar cultivo\n!rpg colher — colher produção pronta\n!rpg fazenda vender TIPO QTD — vender recursos\n!rpg trabalhos — listar profissões\n!rpg emprego NOME — escolher profissão\n!rpg trabalhar — cumprir expediente (4h de intervalo)\n!rpg cidade criar NOME — fundar cidade (5.000 moedas)\n!rpg cidade entrar ID — morar em cidade\n!rpg cidade ajudar VALOR — contribuir com o tesouro\n!rpg cidade doar RECURSO QTD — doar materiais\n!rpg cidade construir EDIFICIO — construir (fundador)\n!rpg cidade ranking — ver cidades existentes\n!rpg magias — ver magias e chances\n!rpg usar_liberador — roleta de poderes\n!rpg conjurar NOME — conjurar poder desbloqueado\n!masmorra entrar/status/atacar/avancar/curar/fugir — expedição de cinco andares\n!forjar lista/RECEITA — fabricar poções e equipamentos com materiais da masmorra\n!chefemundial iniciar [1|2|3]/status/atacar/conjurar NOME — chefes de 100k a 250k HP\n!tripulacao — criar tripulação de pesca, convidar e consultar ranking\n!presente — abrir presente diário do Correio do Polo Norte\n!temporadapesca — status da temporada mensal e evento temático\n!pvp @pessoa — duelo com magias\n!missoes — tarefas diárias e semanais\n\nClasses: guerreiro (dano), mago (magia), guardião (defesa), ladino (crítico). Use !rpg classe. Habilidades: !rpg habilidade.\n\nO Liberador de poder é comprado na loja do RPG. Cada uso sorteia uma magia ainda não desbloqueada; poderes mais raros têm chances menores.\n⭐ Nível: +15 HP máximo, +2 ataque, +1 defesa e 1 ponto de evolução.\n🌳 Evolução: !rpg arvore | !rpg evoluir ataque/defesa/vida/magia.\n🪙 Moedas RPG são separadas dos WACoins.`;
             break;
         }
 
@@ -3797,8 +5436,79 @@ async function processarComando(sock, msg) {
         }
         case '!renascerpesca':
         case '!renascimento': {
-            await renascerPesca(sock,jid,participante,nome);
+            await renascerPesca(sock,jid,participante,nome,args.join(' '));
             registrar = false;
+            break;
+        }
+        case '!eleicao': {
+            resposta = await processarEleicao(sock,jid,participante,nome,args,msg);
+            break;
+        }
+        case '!partido': {
+            resposta = await processarPartido(jid,participante,nome,args,msg);
+            break;
+        }
+        case '!politica':
+        case '!cargo': {
+            const acaoPolitica = normalizar((interpretado.textoArgumentos || args.join(' ')).trim().split(/\s+/)[0] || 'ajuda');
+            const cargo = cargoPoliticoDoUsuario(jid, participante);
+            const g = jid.endsWith('@g.us') ? obterPoliticaGrupo(jid) : null;
+            const m = g?.mandato;
+
+            if (comando === '!cargo') {
+                resposta = cargo
+                    ? `🏛️ Você ocupa o cargo de *${cargo.toUpperCase()}* neste grupo. Use !poderpolitico status.`
+                    : 'Você não ocupa cargo político ativo neste grupo.';
+                break;
+            }
+
+            // Subcomandos de !politica são interpretados separadamente do comando principal.
+            if (acaoPolitica === 'ranking') {
+                if (!jid.endsWith('@g.us')) {
+                    resposta = '🏛️ O ranking político só funciona dentro de grupos.';
+                    break;
+                }
+                const imagemPolitica = await gerarImagemRankingPolitico(jid);
+                await enviar(sock, jid, { image: imagemPolitica, caption: '🏛️ *RANKING POLÍTICO*\n\nCandidatos organizados por cargo e quantidade de votos reais.' });
+                registrar = false;
+                break;
+            }
+
+            if (acaoPolitica === 'status') {
+                resposta = await processarEleicao(sock, jid, participante, nomeResolvido, ['status'], msg);
+                break;
+            }
+            if (acaoPolitica === 'mandatos') {
+                const alvo = obterMencoes(msg)[0] || participante;
+                const quantidade = obterContagemMandatosPoliticos(obterPoliticaGrupo(jid), alvo);
+                resposta = `🏛️ *HISTÓRICO DE MANDATOS*\nPessoa: ${nomeExibicao(alvo)}\nMandatos eleitos: ${quantidade}/2\n${quantidade >= 2 ? '🚫 Limite atingido: não pode concorrer novamente.' : `Pode conquistar mais ${2-quantidade} mandato(s).`} `;
+                break;
+            }
+
+            if (acaoPolitica === 'partidos' || acaoPolitica === 'listarpartidos') {
+                resposta = await processarPartido(jid, participante, nomeResolvido, ['listar'], msg);
+                break;
+            }
+
+            if (acaoPolitica === 'partido') {
+                resposta = await processarPartido(jid, participante, nomeResolvido, args.slice(1), msg);
+                break;
+            }
+
+            if (acaoPolitica === 'eleicao') {
+                resposta = await processarEleicao(sock, jid, participante, nomeResolvido, args.slice(1), msg);
+                break;
+            }
+
+            resposta = `🏛️ *SISTEMA POLÍTICO*\n\n!politica ranking — gerar imagem do ranking eleitoral\n!politica status — consultar eleição e mandato\n!politica mandatos — consultar o limite de reeleições\n!politica partidos — listar partidos\n!politica partido criar NOME — criar partido\n!eleicao criar — administrador inicia eleição\n!eleicao candidatar prefeito/vice/vereador — candidatar-se\n!votar prefeito/vice/vereador @pessoa — votar\n!eleicao status/candidatos — consultar eleição\n!proposta TEXTO — proposta de um vereador\n!proposta votar ID sim/nao — votar proposta\n!poderpolitico status — consultar poderes\n\nMandato: 7 dias.\n${m && Date.now() < m.terminaEm ? `Prefeito: ${m.prefeito?.nome || '—'} | Vice: ${m.vice?.nome || '—'}` : 'Não há mandato ativo.'}`;
+            break;
+        }
+        case '!poderpolitico': {
+            resposta = await processarPoderPolitico(sock,jid,participante,nome,args,msg);
+            break;
+        }
+        case '!proposta': {
+            resposta = await processarPropostaPolitica(jid,participante,nome,args);
             break;
         }
         case '!mercado': {
@@ -3806,11 +5516,23 @@ async function processarComando(sock, msg) {
             break;
         }
         case '!guilda': {
-            resposta = await processarGuilda(participante, nome, args);
+            resposta = await processarGuilda(participante, nome, args, msg);
             break;
         }
         case '!guildas': {
             resposta = listarGuildas();
+            break;
+        }
+        case '!tripulacao': {
+            resposta = await processarTripulacao(participante,nome,args,msg);
+            break;
+        }
+        case '!temporadapesca': {
+            await verificarResetTemporadaPesca(false);
+            const t=sistemasV310.temporadaPesca||{};
+            const evento=obterEventoPescaAtivo();
+            const prox=new Date(new Date(`${dataLocalISO()}T12:00:00-03:00`).getFullYear(),new Date(`${dataLocalISO()}T12:00:00-03:00`).getMonth()+1,1);
+            resposta=`🎣 *TEMPORADA DE PESCA*\nTemporada: #${t.numeroTemporada||1}\nMês: ${t.mesAtual||dataLocalISO().slice(0,7)}\nPróximo reset: ${prox.toLocaleDateString('pt-BR')}\nO reset mensal limpa peixes, capturas, equipamentos e progresso sazonal, mas preserva renascimentos e bônus permanentes.\n\n${evento?`${evento.emoji} Evento ativo: ${evento.nome}\nTermina: ${new Date(evento.terminaEm).toLocaleString('pt-BR',{timeZone:'America/Sao_Paulo'})}\nBônus de sorte: +${evento.bonusSorte}`:'Nenhum evento temático ativo.'}`;
             break;
         }
         case '!diario':
@@ -3841,6 +5563,22 @@ async function processarComando(sock, msg) {
             break;
         }
 
+        case '!masmorra': {
+            resposta = await processarMasmorra(participante, nome, args);
+            break;
+        }
+
+        case '!forjar': {
+            resposta = await processarForja(participante, nome, args);
+            break;
+        }
+
+        case '!poker': {
+            resposta = await processarPoker(sock,jid,participante,nome,args);
+            if (resposta === null) registrar = false;
+            break;
+        }
+
         case '!rpg': {
             if (normalizar(args[0]||'') === 'arvore' || normalizar(args[0]||'') === 'arvore_evolucao') {
                 try {
@@ -3850,7 +5588,7 @@ async function processarComando(sock, msg) {
                     registrar = false;
                 } catch (e) { console.error('[ARVORE RPG]',e); resposta = 'Não consegui gerar a árvore de evolução.'; }
             } else {
-                resposta = await processarRPG(participante, nome, args);
+                resposta = await processarRPG(participante, nome, args, jid);
             }
             break;
         }
@@ -3930,15 +5668,19 @@ async function processarComando(sock, msg) {
 
 📌 *GERAIS*
 !ping
-!upd (novidades das duas últimas atualizações)
+!poker ajuda (poker individual contra o bot)
+!upd (histórico de atualizações)\n!erros [quantidade] (diagnóstico, somente administrador)\n!codigos (catálogo de códigos de erro)\n!codigo 202 (detalhes de um código)\n!buscarcodigo WB-... (localizar mensagem nesta conversa)
 !info
 !doar @pessoa quantidade
 !mercado (trocas entre jogadores)
 !guilda criar NOME / !guilda / !guildas
 !guilda convidar @pessoa / !guilda entrar ID
+!tripulacao criar NOME / convidar / entrar / ranking / transferir
+!temporadapesca (temporada mensal e eventos temáticos)
+!presente (presente diário de Natal até 02/01/2027)
 !diario / !sequencia
 !missoes / !missao diaria|semanal
-!chefemundial iniciar/status/atacar
+!chefemundial iniciar [1|2|3] / status / atacar
 !pvp @pessoa / !pvp aceitar / !pvp atacar / !pvp magia NOME
 !eventopesca (admin)
 !sobre
@@ -3982,6 +5724,8 @@ async function processarComando(sock, msg) {
 🎣 *PESCA*
 !pescar
 !peixes
+!mares / !mar nome (viajar entre mares desbloqueados)
+!renascerpesca (requisitos e confirmação)
 !rankingpesca
 !venderpeixes (vende todos os peixes disponíveis)
 !venderpeixes raridade (ex.: raro, epico, lendario)
@@ -3992,6 +5736,9 @@ async function processarComando(sock, msg) {
 Itens extras: acelerador_1/2/3, peso_1/2/3, anel_1/2/3, relicario_1/2/3, pingente_1/2/3 e linha_1/2/3/4/5
 
 🧩 *JOGOS*
+!poker iniciar [facil|normal|dificil]
+!poker dificuldade facil|normal|dificil
+!poker trocar 1 3 5 / manter / mesa / ranking
 !anagrama (prêmio: 250 WACoins)
 !desanagrama
 !forca (prêmio: 500 WACoins)
@@ -4128,7 +5875,7 @@ Desenvolvido por Ghostine.`
                 resposta = '🎣 Não há nenhum evento de pesca ativo no momento.';
                 break;
             }
-            resposta = `${evento.emoji} *EVENTO DE PESCA ATIVO*\n\n${evento.nome}\n⏳ Tempo restante: *${formatarTempoEvento(evento.terminaEm - Date.now())}*\n🍀 Bônus de sorte: +${evento.bonusSorte}\n🐟 Peixes exclusivos disponíveis.`;
+            resposta = `${evento.emoji} *EVENTO DE PESCA ATIVO*${evento.tematico ? ' — TEMÁTICO AUTOMÁTICO' : ''}\n\n${evento.nome}\n⏳ Tempo restante: *${formatarTempoEvento(evento.terminaEm - Date.now())}*\n🍀 Bônus de sorte: +${evento.bonusSorte}\n🐟 Peixes exclusivos disponíveis.`;
             break;
         }
 
@@ -4409,6 +6156,16 @@ O WABOT gera um cartaz e publica somente nesta conversa. Para divulgar em um can
 
         case '!peixes': {
             resposta = montarColecaoPesca(participante, nome);
+            break;
+        }
+
+        case '!mares': {
+            resposta = montarListaMaresPesca(obterDadosPescador(participante, nome));
+            break;
+        }
+
+        case '!mar': {
+            await selecionarMarPesca(sock, jid, participante, nome, args.join(' '));
             break;
         }
 
@@ -4876,6 +6633,10 @@ Continue jogando para conquistar o primeiro lugar!`
         // ==========================================
 
         case '!votar': {
+            if (['prefeito','vice','vereador'].includes(normalizar(args[0] || ''))) {
+                resposta = await processarVotoPolitico(jid,participante,args,msg);
+                break;
+            }
             const partesVotacao = args.join(' ')
                 .split('|')
                 .map(x => x.trim())
@@ -5201,6 +6962,47 @@ ${escolha === resultado ? '🏆 Você acertou!' : '😅 Não foi dessa vez!'}`;
         }
 
         // ==========================================
+        // CORREIO DO POLO NORTE — PRESENTE DIÁRIO
+        // ==========================================
+
+        case '!presente': {
+            if (!estaNaEdicaoNatalina()) {
+                resposta = '🎁 O Correio do Polo Norte está fechado. O presente diário fica disponível durante a edição natalina, de 23/11/2026 a 02/01/2027.';
+                break;
+            }
+
+            carteirasWACoins.__presentesNatal ||= {};
+            const chavePresente = encontrarChaveUsuario(carteirasWACoins.__presentesNatal, participante) || participante;
+            const registroPresente = carteirasWACoins.__presentesNatal[chavePresente] || {};
+            const hojePresente = dataLocalISO();
+            if (registroPresente.ultimaData === hojePresente) {
+                resposta = `🎄 Você já abriu seu presente de hoje, *${nome}*!\n\nO próximo presente estará disponível amanhã.\n🎅 Último resgate: ${registroPresente.codigo || 'registrado'}.`;
+                break;
+            }
+
+            const recompensa = randomInt(80, 181);
+            const extra = randomInt(1, 101) <= 12;
+            const total = recompensa + (extra ? 120 : 0);
+            const carteiraPresente = obterCarteira(participante, nome);
+            carteiraPresente.saldo = Math.round((Number(carteiraPresente.saldo || 0) + total) * 100) / 100;
+            const codigoPresente = `NATAL-${hojePresente.replace(/-/g, '')}-${randomInt(1000, 10000)}`;
+            carteirasWACoins.__presentesNatal[chavePresente] = {
+                ultimaData: hojePresente,
+                codigo: codigoPresente,
+                totalResgatado: Number(registroPresente.totalResgatado || 0) + total,
+                quantidadeResgates: Number(registroPresente.quantidadeResgates || 0) + 1
+            };
+            await salvarWACoins();
+
+            const imagemPresente = await gerarImagemPresenteNatal(nome, total, extra);
+            const legendaPresente = `🎁 *PRESENTE RESGATADO!*\n\n${extra ? '✨ Você encontrou um bônus surpresa de 120 WACoins!\n' : ''}💰 Recompensa: *${formatarWACoins(total)}*\n🎅 Código do presente: ${codigoPresente}\n📅 Próximo presente: amanhã\n\nUse !presente uma vez por dia até 02/01/2027.`;
+            await enviar(sock, jid, { image: imagemPresente, caption: legendaPresente });
+            resposta = '';
+            registrar = false;
+            break;
+        }
+
+        // ==========================================
         // FRASE
         // ==========================================
 
@@ -5310,7 +7112,9 @@ Falhas: ${resultado.falhas}`;
             resposta =
 `❓ COMANDO NÃO ENCONTRADO
 
-Comando: ${comando}
+Comando: ${comando}${interpretado.sugestao ? `
+
+Você quis dizer *${interpretado.sugestao}*?` : ''}
 
 Use !help para consultar os comandos.`;
             break;
@@ -5328,6 +7132,21 @@ Use !help para consultar os comandos.`;
 function registrarMensagemNaFila(sock, msg) {
     const jid = msg?.key?.remoteJid;
     if (!jid || !msg.message) return;
+
+    // Mensagens comuns de conversa não precisam ocupar a fila do bot.
+    // Mantém comandos, respostas de entrevistas, seleções numéricas da loja e fotos
+    // (que podem ser usadas pelo comando !figurinha).
+    const conteudo = extrairTexto(msg.message).trim();
+    const participante = obterParticipante(msg);
+    const chaveMenu = `${jid}:${participante}`;
+    const ehComando = mensagemTemPrefixo(conteudo);
+    const ehRespostaEntrevista = jid.endsWith('@g.us') && entrevistasAtivas.has(jid) && !ehComando;
+    const ehSelecaoLoja = menusLojaPesca.has(chaveMenu) && (/^!?\d+$/.test(conteudo));
+    const contemImagem = Boolean(msg.message.imageMessage ||
+        msg.message.ephemeralMessage?.message?.imageMessage ||
+        msg.message.viewOnceMessage?.message?.imageMessage ||
+        msg.message.viewOnceMessageV2?.message?.imageMessage);
+    if (!ehComando && !ehRespostaEntrevista && !ehSelecaoLoja && !contemImagem) return;
 
     let fila = filasMensagens.get(jid);
     if (!fila) {
@@ -5418,7 +7237,8 @@ function logSaudeBot() {
     if (agora - ultimoLogSaude < 60000) return;
     ultimoLogSaude = agora;
     const memoria = process.memoryUsage();
-    console.log(`[SAÚDE] RSS=${Math.round(memoria.rss / 1024 / 1024)}MB heap=${Math.round(memoria.heapUsed / 1024 / 1024)}MB ativos=${processamentosAtivos} pendentes=${mensagensPendentes}`);
+    const maiorFila = Math.max(0, ...[...filasMensagens.values()].map(f => f.itens.length));
+    console.log(`[SAÚDE] RSS=${Math.round(memoria.rss / 1024 / 1024)}MB heap=${Math.round(memoria.heapUsed / 1024 / 1024)}MB ativos=${processamentosAtivos}/${MAX_PROCESSAMENTOS_SIMULTANEOS} pendentes=${mensagensPendentes} maiorFila=${maiorFila} conversasFila=${filasMensagens.size} historico=${Object.keys(mensagensComando).length}`);
 }
 
 // ==================================================
@@ -5562,6 +7382,15 @@ async function iniciarBot() {
     }
 }
 
+// Grava o histórico pendente em encerramentos controlados do processo.
+for (const sinal of ['SIGINT', 'SIGTERM']) {
+    process.on(sinal, () => {
+        salvarMensagensPendente()
+            .catch(erro => console.error('[PERSISTÊNCIA] Não foi possível concluir o salvamento final:', erro?.message || erro))
+            .finally(() => process.exit(0));
+    });
+}
+
 // ==================================================
 // INICIALIZAÇÃO
 // ==================================================
@@ -5572,7 +7401,7 @@ iniciarBot().catch(erro => {
     console.error('Falha ao iniciar o WABOT:', erro);
 });
 })().catch(erro => {
-    console.error('[WABOT 3.1.6] ERRO FATAL NA INICIALIZAÇÃO:');
+    console.error('[WABOT 3.3.0] ERRO FATAL NA INICIALIZAÇÃO:');
     console.error(erro?.stack || erro);
     process.exitCode = 1;
 });
