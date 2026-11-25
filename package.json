@@ -1,0 +1,19 @@
+{
+  "name": "wabot",
+  "version": "1.5.0",
+  "description": "Um bot de WhatsApp",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "qrcode-terminal": "^0.12.0",
+    "sharp": "^0.35.5"
+  }
+}
