@@ -1,4 +1,12 @@
 node_modules/
 sessao/
 *.log
-.env
+
+pontuacao-quiz.json
+mensagens-bot.json
+personalizacao-perfil.json
+dados-pesca.json
+entrevistas.json
+wacoins.json
+dados-rpg.json
+dados-sistemas-v310.json
