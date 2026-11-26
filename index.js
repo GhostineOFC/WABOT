@@ -52,7 +52,7 @@ const PASTA_GIFS = path.join(DIRETORIO, 'midia', 'Gifs');
 
 // Adicione seus números autorizados com DDI + DDD, somente dígitos.
 // Exemplo fictício: '5511999999999'
-const NUMEROS_ADM = ['554299070540'];
+const NUMEROS_ADM = ['5511999999999'];
 const FOTOS_RECENTES = new Map();
 const LIMITE_FOTO_STICKER = 8 * 1024 * 1024;
 let botAtivo = true;
